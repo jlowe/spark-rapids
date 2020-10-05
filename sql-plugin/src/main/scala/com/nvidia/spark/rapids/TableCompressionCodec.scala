@@ -238,18 +238,28 @@ abstract class BatchedTableCompressor(maxBatchMemorySize: Long, stream: Cuda.Str
   protected def resizeOversizedOutputs(tables: Array[CompressedTable]): Array[CompressedTable] = {
     withResource(new NvtxRange("copy compressed buffers", NvtxColor.PURPLE)) { _ =>
       withResource(tables) { _ =>
-        tables.safeMap { ct =>
-          val newBuffer = if (ct.buffer.getLength > ct.compressedSize) {
-            closeOnExcept(DeviceMemoryBuffer.allocate(ct.compressedSize)) { buffer =>
-              buffer.copyFromDeviceBufferAsync(
-                0, ct.buffer, 0, ct.compressedSize, stream)
-              buffer
+        withResource(new ArrayBuffer[DeviceMemoryBuffer](tables.length)) { inputBuffers =>
+          val outputBuffers = new ArrayBuffer[DeviceMemoryBuffer](tables.length)
+          closeOnExcept(new Array[CompressedTable](tables.length)) { resized =>
+            tables.indices.foreach { i =>
+              val ct = tables(i)
+              val buffer = if (ct.buffer.getLength > ct.compressedSize) {
+                inputBuffers += ct.buffer.slice(0, ct.compressedSize)
+                val buff = DeviceMemoryBuffer.allocate(ct.compressedSize)
+                outputBuffers += buff
+                buff
+              } else {
+                // reuse this buffer since it is the correct size
+                ct.buffer.incRefCount()
+                ct.buffer
+              }
+              resized(i) = CompressedTable(ct.compressedSize, ct.meta, buffer)
             }
-          } else {
-            ct.buffer.incRefCount()
-            ct.buffer
+
+            // batch-copy the oversized compressed buffers
+            DeviceMemoryBuffer.batchedCopyAsync(outputBuffers.toArray, inputBuffers.toArray, stream)
+            resized
           }
-          CompressedTable(ct.compressedSize, ct.meta, newBuffer)
         }
       }
     }
