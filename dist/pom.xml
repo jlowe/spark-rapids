@@ -145,6 +145,15 @@
                                   <overWrite>false</overWrite>
                                   <outputDirectory>${project.build.directory}/deps</outputDirectory>
                                 </artifactItem>
+                                <artifactItem>
+                                    <groupId>com.nvidia</groupId>
+                                    <artifactId>rapids-4-spark-aggregator_2.12</artifactId>
+                                    <classifier>sparkdb83</classifier>
+                                    <version>${project.version}</version>
+                                    <type>jar</type>
+                                    <overWrite>false</overWrite>
+                                    <outputDirectory>${project.build.directory}/deps</outputDirectory>
+                                </artifactItem>
                             </artifactItems>
                             <outputDirectory>${project.build.directory}/deps</outputDirectory>
                             <overWriteReleases>false</overWriteReleases>
@@ -1253,6 +1262,15 @@
                                   <overWrite>false</overWrite>
                                   <outputDirectory>${project.build.directory}/deps</outputDirectory>
                                 </artifactItem>
+                                <artifactItem>
+                                    <groupId>com.nvidia</groupId>
+                                    <artifactId>rapids-4-spark-aggregator_2.12</artifactId>
+                                    <classifier>sparkdb83</classifier>
+                                    <version>${project.version}</version>
+                                    <type>jar</type>
+                                    <overWrite>false</overWrite>
+                                    <outputDirectory>${project.build.directory}/deps</outputDirectory>
+                                </artifactItem>
                             </artifactItems>
                             <useBaseVersion>true</useBaseVersion>
                             <outputDirectory>${project.build.directory}/deps</outputDirectory>
@@ -1425,6 +1443,18 @@
                                         <unzip
                                                 src="${project.build.directory}/deps/rapids-4-spark-aggregator_${scala.binary.version}-${project.version}-spark320.jar"
                                                 dest="${project.build.directory}/parallel-world/spark320"
+                                        >
+                                            <patternset refid="excludeMeta"/>
+                                        </unzip>
+                                        <unzip
+                                                src="${project.build.directory}/deps/rapids-4-spark-aggregator_${scala.binary.version}-${project.version}-sparkdb83.jar"
+                                                dest="${project.build.directory}/parallel-world/"
+                                        >
+                                            <patternset refid="includeMeta"/>
+                                        </unzip>
+                                        <unzip
+                                                src="${project.build.directory}/deps/rapids-4-spark-aggregator_${scala.binary.version}-${project.version}-sparkdb83.jar"
+                                                dest="${project.build.directory}/parallel-world/sparkdb83"
                                         >
                                             <patternset refid="excludeMeta"/>
                                         </unzip>
