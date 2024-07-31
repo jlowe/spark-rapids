@@ -574,12 +574,13 @@ class ConditionalHashJoinIterator(
 
 
 /**
- * An iterator that does the stream-side only of a hash full join  In other words, it performs the
- * left or right outer join for the stream side's view of a full outer join. As the join is
- * performed, the build-side rows that are referenced during the join are tracked and can be
- * retrieved after the iteration has completed to assist in performing the anti-join needed to
- * produce the final results needed for the full outer join.
+ * An iterator that does the stream-side only of a hash join. Using full join as an example,
+ * it performs the left or right outer join for the stream side's view of a full outer join.
+ * As the join is performed, the build-side rows that are referenced during the join are tracked
+ * and can be retrieved after the iteration has completed to assist in performing the anti-join
+ * needed to produce the final results needed for the full outer join.
  *
+ * @param joinType the type of join being performed
  * @param built spillable form of the build side table. This will be closed by the iterator.
  * @param boundBuiltKeys bound expressions for the build side equi-join keys
  * @param buildSideTrackerInit initial value of the build side row tracker, if any. This will be
@@ -595,7 +596,8 @@ class ConditionalHashJoinIterator(
  * @param opTime metric to update for total operation time
  * @param joinTime metric to update for join time
  */
-class HashFullJoinStreamSideIterator(
+class HashJoinStreamSideIterator(
+    joinType: JoinType,
     built: LazySpillableColumnarBatch,
     boundBuiltKeys: Seq[Expression],
     buildSideTrackerInit: Option[SpillableColumnarBatch],
@@ -615,29 +617,39 @@ class HashFullJoinStreamSideIterator(
       boundStreamKeys,
       streamAttributes,
       targetSize,
-      FullOuter,
+      joinType,
       buildSide,
       opTime = opTime,
       joinTime = joinTime) {
-  // Full Join is implemented via LeftOuter or RightOuter join, depending on the build side.
-  private val useLeftOuterJoin = (buildSide == GpuBuildRight)
+  private val subJoinType = joinType match {
+    case FullOuter if buildSide == GpuBuildRight => LeftOuter
+    case FullOuter if buildSide == GpuBuildLeft => RightOuter
+    case LeftOuter | RightOuter => Inner
+    case t =>
+      throw new IllegalStateException(s"unsupported join type: $t")
+  }
 
   private val nullEquality = if (compareNullsEqual) NullEquality.EQUAL else NullEquality.UNEQUAL
 
   private[this] var builtSideTracker: Option[SpillableColumnarBatch] = buildSideTrackerInit
 
-  private def unconditionalLeftJoinGatherMaps(
+  private def unconditionalJoinGatherMaps(
       leftKeys: Table, rightKeys: Table): Array[GatherMap] = {
-    if (useLeftOuterJoin) {
-      leftKeys.leftJoinGatherMaps(rightKeys, compareNullsEqual)
-    } else {
-      // Reverse the output of the join, because we expect the right gather map to
-      // always be on the right
-      rightKeys.leftJoinGatherMaps(leftKeys, compareNullsEqual).reverse
+    subJoinType match {
+      case LeftOuter =>
+        leftKeys.leftJoinGatherMaps(rightKeys, compareNullsEqual)
+      case RightOuter =>
+        // Reverse the output of the join, because we expect the right gather map to
+        // always be on the right
+        rightKeys.leftJoinGatherMaps(leftKeys, compareNullsEqual).reverse
+      case Inner =>
+        leftKeys.innerJoinGatherMaps(rightKeys, compareNullsEqual)
+      case t =>
+        throw new IllegalStateException(s"unsupported join type: $t")
     }
   }
 
-  private def conditionalLeftJoinGatherMaps(
+  private def conditionalJoinGatherMaps(
       leftKeys: Table,
       leftData: LazySpillableColumnarBatch,
       rightKeys: Table,
@@ -645,14 +657,20 @@ class HashFullJoinStreamSideIterator(
       compiledCondition: CompiledExpression): Array[GatherMap] = {
     withResource(GpuColumnVector.from(leftData.getBatch)) { leftTable =>
       withResource(GpuColumnVector.from(rightData.getBatch)) { rightTable =>
-        if (useLeftOuterJoin) {
-          Table.mixedLeftJoinGatherMaps(leftKeys, rightKeys, leftTable, rightTable,
-            compiledCondition, nullEquality)
-        } else {
-          // Reverse the output of the join, because we expect the right gather map to
-          // always be on the right
-          Table.mixedLeftJoinGatherMaps(rightKeys, leftKeys, rightTable, leftTable,
-            compiledCondition, nullEquality).reverse
+        subJoinType match {
+          case LeftOuter =>
+            Table.mixedLeftJoinGatherMaps(leftKeys, rightKeys, leftTable, rightTable,
+              compiledCondition, nullEquality)
+          case RightOuter =>
+            // Reverse the output of the join, because we expect the right gather map to
+            // always be on the right
+            Table.mixedLeftJoinGatherMaps(rightKeys, leftKeys, rightTable, leftTable,
+              compiledCondition, nullEquality).reverse
+          case Inner =>
+            Table.mixedInnerJoinGatherMaps(leftKeys, rightKeys, leftTable, rightTable,
+              compiledCondition, nullEquality)
+          case t =>
+            throw new IllegalStateException(s"unsupported join type: $t")
         }
       }
     }
@@ -666,9 +684,9 @@ class HashFullJoinStreamSideIterator(
     withResource(new NvtxWithMetrics("full hash join gather map",
       NvtxColor.ORANGE, joinTime)) { _ =>
       val maps = compiledCondition.map { condition =>
-        conditionalLeftJoinGatherMaps(leftKeys, leftData, rightKeys, rightData, condition)
+        conditionalJoinGatherMaps(leftKeys, leftData, rightKeys, rightData, condition)
       }.getOrElse {
-        unconditionalLeftJoinGatherMaps(leftKeys, rightKeys)
+        unconditionalJoinGatherMaps(leftKeys, rightKeys)
       }
       assert(maps.length == 2)
       try {
@@ -680,12 +698,11 @@ class HashFullJoinStreamSideIterator(
             updateTrackingMask(if (buildSide == GpuBuildRight) lazyRightMap else lazyLeftMap)
           }
         }
-        val (leftOutOfBoundsPolicy, rightOutOfBoundsPolicy) = {
-          if (useLeftOuterJoin) {
-            (OutOfBoundsPolicy.DONT_CHECK, OutOfBoundsPolicy.NULLIFY)
-          } else {
-            (OutOfBoundsPolicy.NULLIFY, OutOfBoundsPolicy.DONT_CHECK)
-          }
+        val (leftOutOfBoundsPolicy, rightOutOfBoundsPolicy) = subJoinType match {
+          case LeftOuter => (OutOfBoundsPolicy.DONT_CHECK, OutOfBoundsPolicy.NULLIFY)
+          case RightOuter => (OutOfBoundsPolicy.NULLIFY, OutOfBoundsPolicy.DONT_CHECK)
+          case Inner => (OutOfBoundsPolicy.DONT_CHECK, OutOfBoundsPolicy.DONT_CHECK)
+          case t => throw new IllegalStateException(s"unsupported join type $t")
         }
         val gatherer = JoinGatherer(lazyLeftMap, leftData, lazyRightMap, rightData,
           leftOutOfBoundsPolicy, rightOutOfBoundsPolicy)
@@ -786,10 +803,13 @@ class HashFullJoinStreamSideIterator(
 }
 
 /**
- * An iterator that does a hash full join against a stream of batches.  It does this by
- * doing a left or right outer join and keeping track of the hits on the build side.  It then
+ * An iterator that does a hash outer join against a stream of batches where either the join
+ * type is a full outer join or the join type is a left or right outer join and the build side
+ * matches the outer join side.  It does this by doing a subset of the original join (e.g.:
+ * left outer for a full outer join) and keeping track of the hits on the build side.  It then
  * produces a final batch of all the build side rows that were not already included.
  *
+ * @param joinType the type of join to perform
  * @param built spillable form of the build side table. This will be closed by the iterator.
  * @param boundBuiltKeys bound expressions for the build side equi-join keys
  * @param buildSideTrackerInit initial value of the build side row tracker, if any. This will be
@@ -804,7 +824,8 @@ class HashFullJoinStreamSideIterator(
  * @param opTime metric to update for total operation time
  * @param joinTime metric to update for join time
  */
-class HashFullJoinIterator(
+class HashOuterJoinIterator(
+    joinType: JoinType,
     built: LazySpillableColumnarBatch,
     boundBuiltKeys: Seq[Expression],
     buildSideTrackerInit: Option[SpillableColumnarBatch],
@@ -823,9 +844,9 @@ class HashFullJoinIterator(
     use(opTime.ns(gpuExpr.convertToAst(numFirstConditionTableColumns).compile()))
   }
 
-  private val streamJoinIter = new HashFullJoinStreamSideIterator(built, boundBuiltKeys,
-    buildSideTrackerInit, stream, boundStreamKeys, streamAttributes, compiledCondition, targetSize,
-    buildSide, compareNullsEqual, opTime, joinTime)
+  private val streamJoinIter = new HashJoinStreamSideIterator(joinType, built, boundBuiltKeys,
+      buildSideTrackerInit, stream, boundStreamKeys, streamAttributes, compiledCondition, targetSize,
+      buildSide, compareNullsEqual, opTime, joinTime)
 
   private var finalBatch: Option[ColumnarBatch] = None
 
@@ -1137,7 +1158,7 @@ trait GpuHashJoin extends GpuJoinExec {
           opTime,
           joinTime)
       case FullOuter =>
-        new HashFullJoinIterator(spillableBuiltBatch, boundBuildKeys, None, lazyStream,
+        new HashOuterJoinIterator(joinType, spillableBuiltBatch, boundBuildKeys, None, lazyStream,
           boundStreamKeys, streamedPlan.output, boundCondition, numFirstConditionTableColumns,
           targetSize, buildSide, compareNullsEqual, opTime, joinTime)
       case _ =>

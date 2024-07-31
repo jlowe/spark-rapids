@@ -670,6 +670,16 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .booleanConf
     .createWithDefault(true)
 
+  val USE_SHUFFLED_SYMMETRIC_HASH_JOIN_LEFT_RIGHT_OUTER =
+    conf("spark.rapids.sql.join.useShuffledSymmetricHashJoinLeftRightOuter")
+      .doc("Use the experimental shuffle symmetric hash join designed to improve handling of " +
+        "large joins for left and right outer joins. Requires " +
+        "spark.rapids.sql.shuffledHashJoin.optimizeShuffle=true and " +
+        "spark.rapids.sql.join.useShuffledSymmetricHashJoin=true")
+      .internal()
+      .booleanConf
+      .createWithDefault(true)
+
   val STABLE_SORT = conf("spark.rapids.sql.stableSort.enabled")
       .doc("Enable or disable stable sorting. Apache Spark's sorting is typically a stable " +
           "sort, but sort stability cannot be guaranteed in distributed work loads because the " +
@@ -2580,6 +2590,9 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
   lazy val shuffledHashJoinOptimizeShuffle: Boolean = get(SHUFFLED_HASH_JOIN_OPTIMIZE_SHUFFLE)
 
   lazy val useShuffledSymmetricHashJoin: Boolean = get(USE_SHUFFLED_SYMMETRIC_HASH_JOIN)
+
+  lazy val useShuffledSymmetricHashJoinLeftRightOuter: Boolean =
+    get(USE_SHUFFLED_SYMMETRIC_HASH_JOIN_LEFT_RIGHT_OUTER)
 
   lazy val stableSort: Boolean = get(STABLE_SORT)
 

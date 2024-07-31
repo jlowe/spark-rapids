@@ -31,16 +31,28 @@ import com.nvidia.spark.rapids.shims.GpuHashPartitioning
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression}
-import org.apache.spark.sql.catalyst.plans.{FullOuter, InnerLike, JoinType}
+import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, InnerLike, JoinType, LeftOuter, RightOuter}
 import org.apache.spark.sql.catalyst.plans.physical.Distribution
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.adaptive.ShuffleQueryStageExec
 import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
-import org.apache.spark.sql.rapids.execution.{ConditionalHashJoinIterator, GpuCustomShuffleReaderExec, GpuHashJoin, GpuJoinExec, GpuShuffleExchangeExecBase, HashFullJoinIterator, HashFullJoinStreamSideIterator, HashJoinIterator}
+import org.apache.spark.sql.rapids.execution.{ConditionalHashJoinIterator, GpuCustomShuffleReaderExec, GpuHashJoin, GpuJoinExec, GpuShuffleExchangeExecBase, HashJoinIterator, HashJoinStreamSideIterator, HashOuterJoinIterator}
 import org.apache.spark.sql.types.DataType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 object GpuShuffledSymmetricHashJoinExec {
+  def useSymmetricJoin(conf: RapidsConf, joinType: JoinType): Boolean = {
+    if (conf.useShuffledSymmetricHashJoin) {
+      joinType match {
+        case Inner | FullOuter => true
+        case LeftOuter | RightOuter if conf.useShuffledSymmetricHashJoinLeftRightOuter => true
+        case _ => false
+      }
+    } else {
+      false
+    }
+  }
+
   /** Utility class to track bound expressions and expression metadata related to a join. */
   case class BoundJoinExprs(
       boundBuildKeys: Seq[GpuExpression],
@@ -93,13 +105,13 @@ object GpuShuffledSymmetricHashJoinExec {
   }
 
   /** Utility class to track information related to a join. */
-  class JoinInfo(
-      val joinType: JoinType,
-      val buildSide: GpuBuildSide,
-      val buildIter: Iterator[ColumnarBatch],
-      val buildSize: Long,
-      val streamIter: Iterator[ColumnarBatch],
-      val exprs: BoundJoinExprs)
+  case class JoinInfo(
+      joinType: JoinType,
+      buildSide: GpuBuildSide,
+      buildIter: Iterator[ColumnarBatch],
+      buildSize: Long,
+      streamIter: Iterator[ColumnarBatch],
+      exprs: BoundJoinExprs)
 
   /**
    * Trait to house common code for determining the ideal build/stream
@@ -225,7 +237,7 @@ object GpuShuffledSymmetricHashJoinExec {
           val streamIter = new CollectTimeIterator("fetch join stream",
             setupForJoin(streamQueue, rawStreamIter, exprs.streamTypes, gpuBatchSizeBytes, metrics),
             streamTime)
-          new JoinInfo(joinType, buildSide, buildIter, buildSize, streamIter, exprs)
+          JoinInfo(joinType, buildSide, buildIter, buildSize, streamIter, exprs)
         }
       }
     }
@@ -315,7 +327,17 @@ object GpuShuffledSymmetricHashJoinExec {
       joinTime: GpuMetric): Iterator[ColumnarBatch] = {
     info.joinType match {
       case FullOuter =>
-        new HashFullJoinIterator(spillableBuiltBatch, info.exprs.boundBuildKeys, None,
+        new HashOuterJoinIterator(FullOuter, spillableBuiltBatch, info.exprs.boundBuildKeys, None,
+          lazyStream, info.exprs.boundStreamKeys, info.exprs.streamOutput,
+          info.exprs.boundCondition, info.exprs.numFirstConditionTableColumns,
+          gpuBatchSizeBytes, info.buildSide, info.exprs.compareNullsEqual, opTime, joinTime)
+      case LeftOuter if info.buildSide == GpuBuildLeft =>
+        new HashOuterJoinIterator(LeftOuter, spillableBuiltBatch, info.exprs.boundBuildKeys, None,
+          lazyStream, info.exprs.boundStreamKeys, info.exprs.streamOutput,
+          info.exprs.boundCondition, info.exprs.numFirstConditionTableColumns,
+          gpuBatchSizeBytes, info.buildSide, info.exprs.compareNullsEqual, opTime, joinTime)
+      case RightOuter if info.buildSide == GpuBuildRight =>
+        new HashOuterJoinIterator(RightOuter, spillableBuiltBatch, info.exprs.boundBuildKeys, None,
           lazyStream, info.exprs.boundStreamKeys, info.exprs.streamOutput,
           info.exprs.boundCondition, info.exprs.numFirstConditionTableColumns,
           gpuBatchSizeBytes, info.buildSide, info.exprs.compareNullsEqual, opTime, joinTime)
@@ -383,6 +405,10 @@ case class GpuShuffledSymmetricHashJoinExec(
 
   override def output: Seq[Attribute] = joinType match {
     case _: InnerLike => left.output ++ right.output
+    case LeftOuter =>
+      left.output ++ right.output.map(_.withNullability(true))
+    case RightOuter =>
+      left.output.map(_.withNullability(true)) ++ right.output
     case FullOuter =>
       left.output.map(_.withNullability(true)) ++ right.output.map(_.withNullability(true))
     case x =>
@@ -962,7 +988,7 @@ class BuildSidePartitioner(
     val joinGroups = new mutable.ArrayBuffer[BitSet]()
     val sortedIndices = (0 until numPartitions).sortBy(i => partitions(i).getTotalSize)
     val (emptyIndices, nonEmptyIndices) = joinType match {
-      case FullOuter =>
+      case FullOuter | LeftOuter | RightOuter =>
         // empty build partitions still need to produce outputs for corresponding stream partitions
         (Seq.empty, sortedIndices)
       case _: InnerLike =>
@@ -1080,6 +1106,12 @@ class BigSymmetricJoinIterator(
 
   private val joinGroups = buildPartitioner.getJoinGroups
   private var currentJoinGroupIndex = joinGroups.length - 1
+  private val needTracker = info.joinType match {
+    case FullOuter => true
+    case LeftOuter if info.buildSide == GpuBuildLeft => true
+    case RightOuter if info.buildSide == GpuBuildRight => false
+    case _ => false
+  }
 
   private val streamPartitioner = use(new StreamSidePartitioner(buildPartitioner.numPartitions,
     buildPartitioner.getEmptyPartitions, info.streamIter, info.exprs.streamTypes,
@@ -1087,9 +1119,9 @@ class BigSymmetricJoinIterator(
 
   private var subIter: Option[Iterator[ColumnarBatch]] = None
 
-  // Buffer per join group to track build-side rows that have been referenced for full outer joins
+  // Buffer per join group to track build-side rows that have been referenced for outer joins
   private val buildSideRowTrackers: Array[Option[SpillableColumnarBatch]] = {
-    if (info.joinType == FullOuter) {
+    if (needTracker) {
       val arr = new Array[Option[SpillableColumnarBatch]](joinGroups.length)
       arr.indices.foreach { i => arr(i) = None }
       arr
@@ -1137,10 +1169,10 @@ class BigSymmetricJoinIterator(
 
   private def setupNextJoinIterator(): Unit = {
     while (!isExhausted && !subIter.exists(_.hasNext)) {
-      if (info.joinType == FullOuter) {
+      if (needTracker) {
         // save off the build side tracker buffer for the join group just processed
         subIter match {
-          case Some(streamIter: HashFullJoinStreamSideIterator) =>
+          case Some(streamIter: HashJoinStreamSideIterator) =>
             assert(buildSideRowTrackers(currentJoinGroupIndex).isEmpty, "unexpected row tracker")
             buildSideRowTrackers(currentJoinGroupIndex) = streamIter.releaseBuiltSideTracker()
             streamIter.close()
@@ -1152,7 +1184,7 @@ class BigSymmetricJoinIterator(
         if (streamPartitioner.hasInputBatches) {
           streamPartitioner.partitionNextBatch()
           subIter = Some(moveToNextBuildGroup())
-        } else if (info.joinType == FullOuter) {
+        } else if (needTracker) {
           currentJoinGroupIndex = buildSideRowTrackers.indexWhere(_.isDefined)
           if (currentJoinGroupIndex == -1) {
             isExhausted = true
@@ -1168,7 +1200,7 @@ class BigSymmetricJoinIterator(
             // side. The condition also doesn't need to be passed since there are no join row pairs
             // left to evaluate conditionally. The only rows that will be emitted by this are the
             // build-side rows that never matched rows on the stream side.
-            subIter = Some(new HashFullJoinIterator(
+            subIter = Some(new HashOuterJoinIterator(info.joinType,
               buildPartitioner.getBuildBatch(currentJoinGroupIndex), info.exprs.boundBuildKeys,
               tracker, Iterator.empty, info.exprs.boundStreamKeys, info.exprs.streamOutput,
               None, 0, gpuBatchSizeBytes, info.buildSide, info.exprs.compareNullsEqual,
@@ -1208,13 +1240,14 @@ class BigSymmetricJoinIterator(
         }
       }
     }
-    if (info.joinType == FullOuter) {
-      // Build an iterator to perform the stream-side of the full outer join for the join group,
+    if (needTracker) {
+      // Build an iterator to perform the stream-side of the outer join for the join group,
       // tracking which rows are referenced so far. The iterator will own the tracker of build side
       // rows referenced until we release it after the iterator has produced all of the batches.
       val buildRowTracker = buildSideRowTrackers(currentJoinGroupIndex)
       buildSideRowTrackers(currentJoinGroupIndex) = None
-      new HashFullJoinStreamSideIterator(builtBatch, info.exprs.boundBuildKeys, buildRowTracker,
+      new HashJoinStreamSideIterator(info.joinType,
+        builtBatch, info.exprs.boundBuildKeys,buildRowTracker,
         lazyStream, info.exprs.boundStreamKeys, info.exprs.streamOutput, compiledCondition,
         gpuBatchSizeBytes, info.buildSide, info.exprs.compareNullsEqual, opTime, joinTime)
     } else {
