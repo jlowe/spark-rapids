@@ -70,7 +70,9 @@ class GpuShuffledHashJoinMeta(
       (None, condition)
     }
     val Seq(left, right) = childPlans.map(_.convertIfNeeded())
-    val joinExec = if (GpuShuffledSymmetricHashJoinExec.useSymmetricJoin(conf, join.joinType)) {
+    val useSymmetric = GpuShuffledSymmetricHashJoinExec.useSymmetricJoin(conf, join.joinType,
+      join.leftKeys, join.rightKeys)
+    val joinExec = if (useSymmetric) {
       GpuShuffledSymmetricHashJoinExec(
         join.joinType,
         leftKeys.map(_.convertToGpu()),

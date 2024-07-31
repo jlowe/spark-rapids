@@ -41,11 +41,19 @@ import org.apache.spark.sql.types.DataType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 object GpuShuffledSymmetricHashJoinExec {
-  def useSymmetricJoin(conf: RapidsConf, joinType: JoinType): Boolean = {
+  def useSymmetricJoin(
+      conf: RapidsConf,
+      joinType: JoinType,
+      leftKeys: Seq[Expression],
+      rightKeys: Seq[Expression]): Boolean = {
     if (conf.useShuffledSymmetricHashJoin) {
       joinType match {
         case Inner | FullOuter => true
-        case LeftOuter | RightOuter if conf.useShuffledSymmetricHashJoinLeftRightOuter => true
+        case LeftOuter | RightOuter if conf.useShuffledSymmetricHashJoinLeftRightOuter =>
+          // currently cannot handle the case where the outer join becomes the build side
+          // and there are nullable struct children in the join keys
+          !GpuHashJoin.anyNullableStructChild(leftKeys) &&
+            !GpuHashJoin.anyNullableStructChild(rightKeys)
         case _ => false
       }
     } else {
