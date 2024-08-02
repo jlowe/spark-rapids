@@ -344,6 +344,8 @@ private final class GpuSemaphore() extends Logging {
     }
   }
 
+  def isAcquired(context: TaskContext): Boolean = tasks.contains(context.taskAttemptId())
+
   def acquireIfNecessary(context: TaskContext): Unit = {
     // Make sure that the thread/task is registered before we try and block
     TaskRegistryTracker.registerThreadForRetry()

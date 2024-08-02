@@ -680,6 +680,14 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
       .booleanConf
       .createWithDefault(true)
 
+  val JOIN_OUTER_MAGNIFICATION_THRESHOLD =
+    conf("spark.rapids.sql.join.outer.magnificationFactorThreshold")
+      .doc("The magnification factor threshold at which outer joins will consider using the " +
+        "unnatural side of the join to build the hash table")
+      .internal()
+      .integerConf
+      .createWithDefault(10000)
+
   val STABLE_SORT = conf("spark.rapids.sql.stableSort.enabled")
       .doc("Enable or disable stable sorting. Apache Spark's sorting is typically a stable " +
           "sort, but sort stability cannot be guaranteed in distributed work loads because the " +
