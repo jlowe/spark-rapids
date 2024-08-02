@@ -118,6 +118,7 @@ object GpuShuffledSymmetricHashJoinExec {
       buildSide: GpuBuildSide,
       buildIter: Iterator[ColumnarBatch],
       buildSize: Long,
+      buildStats: Option[JoinBuildSideStats],
       streamIter: Iterator[ColumnarBatch],
       exprs: BoundJoinExprs)
 
@@ -125,7 +126,7 @@ object GpuShuffledSymmetricHashJoinExec {
    * Trait to house common code for determining the ideal build/stream
    * assignments for symmetric joins.
    */
-  trait SymmetricJoinSizer[T <: AutoCloseable] {
+  trait JoinSizer[T <: AutoCloseable] {
     /** Wrap, if necessary, an iterator in preparation for probing the size before a join. */
     def setupForProbe(iter: Iterator[ColumnarBatch]): Iterator[T]
 
@@ -161,6 +162,40 @@ object GpuShuffledSymmetricHashJoinExec {
      */
     val startWithLeftSide: Boolean
 
+    /**
+     * Probe the left and right join inputs to determine which side should be used as the build
+     * side and which should be used as the stream side.
+     *
+     * @param joinType type of join to perform
+     * @param leftKeys join keys for the left table
+     * @param leftOutput schema of the left table
+     * @param rawLeftIter iterator of batches for the left table
+     * @param rightKeys join keys for the right table
+     * @param rightOutput schema of the right table
+     * @param rawRightIter iterator of batches for the right table
+     * @param condition inequality portions of the join condition
+     * @param gpuBatchSizeBytes target GPU batch size
+     * @param metrics map of metrics to update
+     * @return join information including build side, bound expressions, etc.
+     */
+    def getJoinInfo(
+        joinType: JoinType,
+        leftKeys: Seq[Expression],
+        leftOutput: Seq[Attribute],
+        rawLeftIter: Iterator[ColumnarBatch],
+        rightKeys: Seq[Expression],
+        rightOutput: Seq[Attribute],
+        rawRightIter: Iterator[ColumnarBatch],
+        condition: Option[Expression],
+        gpuBatchSizeBytes: Long,
+        metrics: Map[String, GpuMetric]): JoinInfo
+  }
+
+  /**
+   * Trait to house common code for determining the ideal build/stream
+   * assignments for symmetric joins.
+   */
+  trait SymmetricJoinSizer[T <: AutoCloseable] extends JoinSizer[T] {
     /**
      * Probe the left and right join inputs to determine which side should be used as the build
      * side and which should be used as the stream side.

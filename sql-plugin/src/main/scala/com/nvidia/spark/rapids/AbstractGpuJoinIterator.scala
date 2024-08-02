@@ -353,6 +353,10 @@ abstract class SplittableJoinIterator(
           // Distinct left outer joins only produce a single gather map since left table rows
           // are not rearranged by the join.
           Some(maps.head)
+        case RightOuter if maps.length == 1 =>
+          // Distinct right outer joins only produce a single gather map since right table rows
+          // are not rearranged by the join.
+          new JoinGathererSameTable(rightData)
         case _ if maps.length == 1 => None
         case _ => Some(maps(1))
       }

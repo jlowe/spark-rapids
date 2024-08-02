@@ -256,6 +256,27 @@ object GpuHashJoin {
   }
 }
 
+/**
+ * Class to hold statistics on the build-side batch of a hash join.
+ * @param streamMagnificationFactor estimated magnification of a stream batch during join
+ * @param isDistinct true if all build-side join keys are distinct
+ */
+case class JoinBuildSideStats(streamMagnificationFactor: Double, isDistinct: Boolean)
+
+object JoinBuildSideStats {
+  def fromBuildKeys(buildKeys: ColumnarBatch): JoinBuildSideStats = {
+    // Based off of the keys on the build side guess at how many output rows there
+    // will be for each input row on the stream side. This does not take into account
+    // the join type, data skew or even if the keys actually match.
+    val builtCount = withResource(GpuColumnVector.from(buildKeys)) { keysTable =>
+      keysTable.distinctCount(NullEquality.EQUAL)
+    }
+    val isDistinct = builtCount == buildKeys.numRows()
+    val magnificationFactor = buildKeys.numRows().toDouble / builtCount
+    JoinBuildSideStats(magnificationFactor, isDistinct)
+  }
+}
+
 abstract class BaseHashJoinIterator(
     built: LazySpillableColumnarBatch,
     boundBuiltKeys: Seq[Expression],
@@ -276,20 +297,20 @@ abstract class BaseHashJoinIterator(
       opTime = opTime,
       joinTime = joinTime) {
   // We can cache this because the build side is not changing
-  protected lazy val (streamMagnificationFactor, isDistinctJoin) = joinType match {
+  protected lazy val buildStats: JoinBuildSideStats = joinType match {
     case _: InnerLike | LeftOuter | RightOuter | FullOuter =>
       built.checkpoint()
       withRetryNoSplit {
         withRestoreOnRetry(built) {
           // This is okay because the build keys must be deterministic
           withResource(GpuProjectExec.project(built.getBatch, boundBuiltKeys)) { builtKeys =>
-            guessStreamMagnificationFactor(builtKeys)
+            JoinBuildSideStats.fromBuildKeys(builtKeys)
           }
         }
       }
     case _ =>
       // existence joins don't change size
-      (1.0, false)
+      JoinBuildSideStats(1.0, isDistinct = false)
   }
 
   override def computeNumJoinRows(cb: LazySpillableColumnarBatch): Long = {
@@ -298,7 +319,7 @@ abstract class BaseHashJoinIterator(
     joinType match {
       // Full Outer join is implemented via LeftOuter/RightOuter, so use same estimate.
       case _: InnerLike | LeftOuter | RightOuter | FullOuter =>
-        Math.ceil(cb.numRows * streamMagnificationFactor).toLong
+        Math.ceil(cb.numRows * buildStats.streamMagnificationFactor).toLong
       case _ => cb.numRows
     }
   }
@@ -398,30 +419,13 @@ abstract class BaseHashJoinIterator(
     }
   }
 
-  /**
-   * Guess the magnification factor for a stream side batch and detect if the build side contains
-   * only unique join keys.
-   * This is temporary until cudf gives us APIs to get the actual gather map size.
-   */
-  private def guessStreamMagnificationFactor(builtKeys: ColumnarBatch): (Double, Boolean) = {
-    // Based off of the keys on the build side guess at how many output rows there
-    // will be for each input row on the stream side. This does not take into account
-    // the join type, data skew or even if the keys actually match.
-    val builtCount = withResource(GpuColumnVector.from(builtKeys)) { keysTable =>
-      keysTable.distinctCount(NullEquality.EQUAL)
-    }
-    val isDistinct = builtCount == builtKeys.numRows()
-    val magnificationFactor = builtKeys.numRows().toDouble / builtCount
-    (magnificationFactor, isDistinct)
-  }
-
   private def estimatedNumBatches(cb: LazySpillableColumnarBatch): Int = joinType match {
     case _: InnerLike | LeftOuter | RightOuter | FullOuter =>
       // We want the gather map size to be around the target size. There are two gather maps
       // that are made up of ints, so estimate how many rows per batch on the stream side
       // will produce the desired gather map size.
       val approximateStreamRowCount = ((targetSize.toDouble / 2) /
-          DType.INT32.getSizeInBytes) / streamMagnificationFactor
+          DType.INT32.getSizeInBytes) / buildStats.streamMagnificationFactor
       val estimatedRowsPerStreamBatch = Math.min(Int.MaxValue, approximateStreamRowCount)
       Math.ceil(cb.numRows / estimatedRowsPerStreamBatch).toInt
     case _ => 1
@@ -466,14 +470,16 @@ class HashJoinIterator(
         None
       } else {
         val maps = joinType match {
-          case LeftOuter if isDistinctJoin =>
+          case LeftOuter if buildStats.isDistinct =>
             Array(leftKeys.leftDistinctJoinGatherMap(rightKeys, compareNullsEqual))
           case LeftOuter => leftKeys.leftJoinGatherMaps(rightKeys, compareNullsEqual)
+          case RightOuter if buildStats.isDistinct =>
+            Array(rightKeys.leftDistinctJoinGatherMap(leftKeys, compareNullsEqual))
           case RightOuter =>
             // Reverse the output of the join, because we expect the right gather map to
             // always be on the right
             rightKeys.leftJoinGatherMaps(leftKeys, compareNullsEqual).reverse
-          case _: InnerLike if isDistinctJoin =>
+          case _: InnerLike if buildStats.isDistinct =>
             if (buildSide == GpuBuildRight) {
               leftKeys.innerDistinctJoinGatherMaps(rightKeys, compareNullsEqual)
             } else {
