@@ -280,6 +280,7 @@ object JoinBuildSideStats {
 abstract class BaseHashJoinIterator(
     built: LazySpillableColumnarBatch,
     boundBuiltKeys: Seq[Expression],
+    buildStatsOpt: Option[JoinBuildSideStats],
     stream: Iterator[LazySpillableColumnarBatch],
     boundStreamKeys: Seq[Expression],
     streamAttributes: Seq[Attribute],
@@ -297,20 +298,22 @@ abstract class BaseHashJoinIterator(
       opTime = opTime,
       joinTime = joinTime) {
   // We can cache this because the build side is not changing
-  protected lazy val buildStats: JoinBuildSideStats = joinType match {
-    case _: InnerLike | LeftOuter | RightOuter | FullOuter =>
-      built.checkpoint()
-      withRetryNoSplit {
-        withRestoreOnRetry(built) {
-          // This is okay because the build keys must be deterministic
-          withResource(GpuProjectExec.project(built.getBatch, boundBuiltKeys)) { builtKeys =>
-            JoinBuildSideStats.fromBuildKeys(builtKeys)
+  protected lazy val buildStats: JoinBuildSideStats = buildStatsOpt.getOrElse {
+    joinType match {
+      case _: InnerLike | LeftOuter | RightOuter | FullOuter =>
+        built.checkpoint()
+        withRetryNoSplit {
+          withRestoreOnRetry(built) {
+            // This is okay because the build keys must be deterministic
+            withResource(GpuProjectExec.project(built.getBatch, boundBuiltKeys)) { builtKeys =>
+              JoinBuildSideStats.fromBuildKeys(builtKeys)
+            }
           }
         }
-      }
-    case _ =>
-      // existence joins don't change size
-      JoinBuildSideStats(1.0, isDistinct = false)
+      case _ =>
+        // existence joins don't change size
+        JoinBuildSideStats(1.0, isDistinct = false)
+    }
   }
 
   override def computeNumJoinRows(cb: LazySpillableColumnarBatch): Long = {
@@ -438,6 +441,7 @@ abstract class BaseHashJoinIterator(
 class HashJoinIterator(
     built: LazySpillableColumnarBatch,
     val boundBuiltKeys: Seq[Expression],
+    buildStatsOpt: Option[JoinBuildSideStats],
     private val stream: Iterator[LazySpillableColumnarBatch],
     val boundStreamKeys: Seq[Expression],
     val streamAttributes: Seq[Attribute],
@@ -450,6 +454,7 @@ class HashJoinIterator(
     extends BaseHashJoinIterator(
       built,
       boundBuiltKeys,
+      buildStatsOpt,
       stream,
       boundStreamKeys,
       streamAttributes,
@@ -473,8 +478,6 @@ class HashJoinIterator(
           case LeftOuter if buildStats.isDistinct =>
             Array(leftKeys.leftDistinctJoinGatherMap(rightKeys, compareNullsEqual))
           case LeftOuter => leftKeys.leftJoinGatherMaps(rightKeys, compareNullsEqual)
-          case RightOuter if buildStats.isDistinct =>
-            Array(rightKeys.leftDistinctJoinGatherMap(leftKeys, compareNullsEqual))
           case RightOuter =>
             // Reverse the output of the join, because we expect the right gather map to
             // always be on the right
@@ -505,6 +508,7 @@ class HashJoinIterator(
 class ConditionalHashJoinIterator(
     built: LazySpillableColumnarBatch,
     boundBuiltKeys: Seq[Expression],
+    buildStatsOpt: Option[JoinBuildSideStats],
     stream: Iterator[LazySpillableColumnarBatch],
     boundStreamKeys: Seq[Expression],
     streamAttributes: Seq[Attribute],
@@ -518,6 +522,7 @@ class ConditionalHashJoinIterator(
     extends BaseHashJoinIterator(
       built,
       boundBuiltKeys,
+      buildStatsOpt,
       stream,
       boundStreamKeys,
       streamAttributes,
@@ -589,6 +594,7 @@ class ConditionalHashJoinIterator(
  * @param joinType the type of join being performed
  * @param built spillable form of the build side table. This will be closed by the iterator.
  * @param boundBuiltKeys bound expressions for the build side equi-join keys
+ * @param buildStatsOpt statistics computed for the build side batch, if any
  * @param buildSideTrackerInit initial value of the build side row tracker, if any. This will be
  *                             closed by the iterator.
  * @param stream iterator to produce batches for the stream side table
@@ -606,6 +612,7 @@ class HashJoinStreamSideIterator(
     joinType: JoinType,
     built: LazySpillableColumnarBatch,
     boundBuiltKeys: Seq[Expression],
+    buildStatsOpt: Option[JoinBuildSideStats],
     buildSideTrackerInit: Option[SpillableColumnarBatch],
     stream: Iterator[LazySpillableColumnarBatch],
     boundStreamKeys: Seq[Expression],
@@ -619,6 +626,7 @@ class HashJoinStreamSideIterator(
     extends BaseHashJoinIterator(
       built,
       boundBuiltKeys,
+      buildStatsOpt,
       stream,
       boundStreamKeys,
       streamAttributes,
@@ -818,6 +826,7 @@ class HashJoinStreamSideIterator(
  * @param joinType the type of join to perform
  * @param built spillable form of the build side table. This will be closed by the iterator.
  * @param boundBuiltKeys bound expressions for the build side equi-join keys
+ * @param buildStats statistics computed for the build side batch, if any
  * @param buildSideTrackerInit initial value of the build side row tracker, if any. This will be
  *                             closed by the iterator.
  * @param stream iterator to produce batches for the stream side table
@@ -834,6 +843,7 @@ class HashOuterJoinIterator(
     joinType: JoinType,
     built: LazySpillableColumnarBatch,
     boundBuiltKeys: Seq[Expression],
+    buildStats: Option[JoinBuildSideStats],
     buildSideTrackerInit: Option[SpillableColumnarBatch],
     stream: Iterator[LazySpillableColumnarBatch],
     boundStreamKeys: Seq[Expression],
@@ -851,8 +861,8 @@ class HashOuterJoinIterator(
   }
 
   private val streamJoinIter = new HashJoinStreamSideIterator(joinType, built, boundBuiltKeys,
-      buildSideTrackerInit, stream, boundStreamKeys, streamAttributes, compiledCondition, targetSize,
-      buildSide, compareNullsEqual, opTime, joinTime)
+    buildStats, buildSideTrackerInit, stream, boundStreamKeys, streamAttributes, compiledCondition,
+    targetSize, buildSide, compareNullsEqual, opTime, joinTime)
 
   private var finalBatch: Option[ColumnarBatch] = None
 
@@ -1164,21 +1174,22 @@ trait GpuHashJoin extends GpuJoinExec {
           opTime,
           joinTime)
       case FullOuter =>
-        new HashOuterJoinIterator(joinType, spillableBuiltBatch, boundBuildKeys, None, lazyStream,
-          boundStreamKeys, streamedPlan.output, boundCondition, numFirstConditionTableColumns,
-          targetSize, buildSide, compareNullsEqual, opTime, joinTime)
+        new HashOuterJoinIterator(joinType, spillableBuiltBatch, boundBuildKeys, None, None,
+          lazyStream, boundStreamKeys, streamedPlan.output,
+          boundCondition, numFirstConditionTableColumns, targetSize, buildSide,
+          compareNullsEqual, opTime, joinTime)
       case _ =>
         if (boundCondition.isDefined) {
           // ConditionalHashJoinIterator will close the compiled condition
           val compiledCondition =
             boundCondition.get.convertToAst(numFirstConditionTableColumns).compile()
-          new ConditionalHashJoinIterator(spillableBuiltBatch, boundBuildKeys, lazyStream,
-            boundStreamKeys, streamedPlan.output, compiledCondition,
+          new ConditionalHashJoinIterator(spillableBuiltBatch, boundBuildKeys, None,
+            lazyStream, boundStreamKeys, streamedPlan.output, compiledCondition,
             targetSize, joinType, buildSide, compareNullsEqual, opTime, joinTime)
         } else {
-          new HashJoinIterator(spillableBuiltBatch, boundBuildKeys, lazyStream, boundStreamKeys,
-            streamedPlan.output, targetSize, joinType, buildSide, compareNullsEqual,
-            opTime, joinTime)
+          new HashJoinIterator(spillableBuiltBatch, boundBuildKeys, None,
+            lazyStream, boundStreamKeys, streamedPlan.output, targetSize, joinType, buildSide,
+            compareNullsEqual, opTime, joinTime)
         }
     }
 
