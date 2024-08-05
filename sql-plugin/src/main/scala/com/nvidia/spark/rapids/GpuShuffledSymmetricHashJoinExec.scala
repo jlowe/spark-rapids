@@ -158,12 +158,6 @@ object GpuShuffledSymmetricHashJoinExec {
     def getProbeBatchDataSize(batch: T): Long
 
     /**
-     * Whether to start pulling from the left or right input iterator when probing for data sizes.
-     * This helps avoid grabbing the GPU semaphore too early when probing.
-     */
-    val startWithLeftSide: Boolean
-
-    /**
      * Probe the left and right join inputs to determine which side should be used as the build
      * side and which should be used as the stream side.
      *
@@ -197,6 +191,12 @@ object GpuShuffledSymmetricHashJoinExec {
    * assignments for symmetric joins.
    */
   trait SymmetricJoinSizer[T <: AutoCloseable] extends JoinSizer[T] {
+    /**
+     * Whether to start pulling from the left or right input iterator when probing for data sizes.
+     * This helps avoid grabbing the GPU semaphore too early when probing.
+     */
+    val startWithLeftSide: Boolean
+
     override def getJoinInfo(
         joinType: JoinType,
         leftKeys: Seq[Expression],
@@ -472,15 +472,14 @@ object GpuShuffledSymmetricHashJoinExec {
     override def getProbeBatchDataSize(batch: SpillableHostConcatResult): Long = {
       batch.header.getDataLen
     }
-
-    override val startWithLeftSide: Boolean = true
   }
 
   class HostHostSymmetricJoinSizer extends SymmetricJoinSizer[SpillableHostConcatResult]
     with HostHostJoinSizer {
+    override val startWithLeftSide: Boolean = true
   }
 
-  class HostHostAsymmetricOuterJoinSizer
+  class HostHostAsymmetricOuterJoinSizer(override val magnificationThreshold: Int)
     extends AsymmetricOuterJoinSizer[SpillableHostConcatResult] with HostHostJoinSizer {
   }
 
@@ -514,7 +513,7 @@ object GpuShuffledSymmetricHashJoinExec {
     extends SymmetricJoinSizer[SpillableColumnarBatch] with SpillableColumnarBatchJoinSizer {
   }
 
-  class SpillableColumnarBatchAsymmetricOuterJoinSizer(override val startWithLeftSide: Boolean)
+  class SpillableColumnarBatchAsymmetricOuterJoinSizer(override val magnificationThreshold: Int)
     extends AsymmetricOuterJoinSizer[SpillableColumnarBatch] with SpillableColumnarBatchJoinSizer {
   }
 
