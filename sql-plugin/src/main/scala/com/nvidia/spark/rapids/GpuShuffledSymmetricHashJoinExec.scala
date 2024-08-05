@@ -27,6 +27,7 @@ import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.RmmRapidsRetryIterator.withRetryNoSplit
 import com.nvidia.spark.rapids.ScalableTaskCompletion.onTaskCompletion
 import com.nvidia.spark.rapids.shims.GpuHashPartitioning
+import org.apache.spark.TaskContext
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
@@ -296,10 +297,11 @@ object GpuShuffledSymmetricHashJoinExec {
       val rightIter = new CollectTimeIterator("probe right", setupForProbe(rawRightIter), rightTime)
       closeOnExcept(mutable.Queue.empty[T]) { leftQueue =>
         closeOnExcept(mutable.Queue.empty[T]) { rightQueue =>
-          val (naturalBuildIter, naturalBuildQueue, naturalStreamIter, naturalStreamQueue) =
+          val (naturalBuildIter, naturalBuildQueue, naturalStreamIter, naturalStreamQueue,
+          naturalBuildSide) =
             joinType match {
-              case LeftOuter => (rightIter, rightQueue, leftIter, leftQueue)
-              case RightOuter => (leftIter, leftQueue, rightIter, rightQueue)
+              case LeftOuter => (rightIter, rightQueue, leftIter, leftQueue, GpuBuildRight)
+              case RightOuter => (leftIter, leftQueue, rightIter, rightQueue, GpuBuildLeft)
               case _ => throw new IllegalStateException(s"unexpected join type $joinType")
             }
           val (naturalRows, naturalSize) = fetchTargetSize(naturalBuildIter, naturalBuildQueue,
@@ -312,68 +314,94 @@ object GpuShuffledSymmetricHashJoinExec {
             if (naturalRows < magnificationThreshold) {
               // impossible for build-side to exceed magnification threshold with so few rows
               setup_the_join_here
-            } else {
-              check if semaphore is acquired, pull in stream side batches first if not acquired
-              
-              val (streamRows, streamSize) = fetchTargetSize(naturalStreamIter, naturalStreamQueue,
-                gpuBatchSizeBytes)
-
-            }
-          }
-          var leftSize = 0L
-          var rightSize = 0L
-          var buildSide: GpuBuildSide = null
-          while (buildSide == null) {
-            if (leftSize < rightSize || (startWithLeftSide && leftSize == rightSize)) {
-              if (leftIter.hasNext) {
-                val leftBatch = leftIter.next()
-                if (getProbeBatchRowCount(leftBatch) > 0) {
-                  leftQueue += leftBatch
-                  leftSize += getProbeBatchDataSize(leftBatch)
-                } else {
-                  leftBatch.close()
+            } else if (!GpuSemaphore.isAcquired(TaskContext.get)) {
+              val (streamRows, streamSize) = fetchTargetSize(naturalStreamIter,
+                naturalStreamQueue, gpuBatchSizeBytes)
+              if (streamRows < Int.MaxValue && streamSize < gpuBatchSizeBytes) {
+                assert(!naturalStreamIter.hasNext, "stream side not exhausted")
+                val exprs = BoundJoinExprs.bind(joinType, leftKeys, leftOutput, rightKeys,
+                  rightOutput,
+                  condition, naturalBuildSide)
+                val buildBatch = getSingleBatch(naturalBuildQueue, exprs.boundBuildKeys,
+                  exprs.buildTypes, gpuBatchSizeBytes, exprs.buildSideNeedsNullFilter, metrics)
+                closeOnExcept(buildBatch) { _ =>
+                  val buildStats = JoinBuildSideStats.fromBatch(buildBatch, exprs.boundBuildKeys)
+                  if (buildStats.streamMagnificationFactor < magnificationThreshold) {
+                    setup_the_join_here
+                  } else {
+                    val streamBatch = getSingleBatch(naturalStreamQueue, exprs.boundStreamKeys,
+                      exprs.streamTypes, gpuBatchSizeBytes, exprs.buildSideNeedsNullFilter,
+                      metrics)
+                    closeOnExcept(streamBatch) { _ =>
+                      val streamStats = JoinBuildSideStats.fromBatch(streamBatch,
+                        exprs.boundStreamKeys)
+                      if (buildStats.streamMagnificationFactor <
+                        streamStats.streamMagnificationFactor) {
+                        setup_the_join_here
+                      } else {
+                        flip_the_join_here
+                      }
+                    }
+                  }
                 }
               } else {
-                buildSide = GpuBuildLeft
+                setup_the_join_here
               }
             } else {
-              if (rightIter.hasNext) {
-                val rightBatch = rightIter.next()
-                if (getProbeBatchRowCount(rightBatch) > 0) {
-                  rightQueue += rightBatch
-                  rightSize += getProbeBatchDataSize(rightBatch)
+              val exprs = BoundJoinExprs.bind(joinType, leftKeys, leftOutput, rightKeys,
+                rightOutput, condition, naturalBuildSide)
+              val buildBatch = getSingleBatch(naturalBuildQueue, exprs.boundBuildKeys,
+                exprs.buildTypes, gpuBatchSizeBytes, exprs.buildSideNeedsNullFilter, metrics)
+              closeOnExcept(buildBatch) { _ =>
+                val buildStats = JoinBuildSideStats.fromBatch(buildBatch, exprs.boundBuildKeys)
+                if (buildStats.streamMagnificationFactor < magnificationThreshold) {
+                  setup_the_join_here
                 } else {
-                  rightBatch.close()
+                  val (streamRows, streamSize) = fetchTargetSize(naturalStreamIter,
+                    naturalStreamQueue, gpuBatchSizeBytes)
+                  if (streamRows < Int.MaxValue && streamSize < gpuBatchSizeBytes) {
+                    assert(!naturalStreamIter.hasNext, "stream side not exhausted")
+                    val exprs = BoundJoinExprs.bind(joinType, leftKeys, leftOutput, rightKeys,
+                      rightOutput,
+                      condition, naturalBuildSide)
+                    val buildBatch = getSingleBatch(naturalBuildQueue, exprs.boundBuildKeys,
+                      exprs.buildTypes, gpuBatchSizeBytes, exprs.buildSideNeedsNullFilter, metrics)
+                    closeOnExcept(buildBatch) { _ =>
+                      val buildStats = JoinBuildSideStats.fromBatch(buildBatch,
+                        exprs.boundBuildKeys)
+                      if (buildStats.streamMagnificationFactor < magnificationThreshold) {
+                        setup_the_join_here
+                      } else {
+                        val streamBatch = getSingleBatch(naturalStreamQueue, exprs.boundStreamKeys,
+                          exprs.streamTypes, gpuBatchSizeBytes, exprs.buildSideNeedsNullFilter,
+                          metrics)
+                        closeOnExcept(streamBatch) { _ =>
+                          val streamStats = JoinBuildSideStats.fromBatch(streamBatch,
+                            exprs.boundStreamKeys)
+                          if (buildStats.streamMagnificationFactor <
+                            streamStats.streamMagnificationFactor) {
+                            setup_the_join_here
+                          } else {
+                            flip_the_join_here
+                          }
+                        }
+                      }
+                    }
+                  } else {
+                    setup_the_join_here
+                  }
                 }
-              } else {
-                buildSide = GpuBuildRight
               }
             }
-          }
-          val exprs = BoundJoinExprs.bind(joinType, leftKeys, leftOutput, rightKeys, rightOutput,
-            condition, buildSide)
-          val (buildQueue, buildSize, streamQueue, rawStreamIter) = buildSide match {
-            case GpuBuildRight =>
-              buildTime += rightTime.value
-              streamTime += leftTime.value
-              (rightQueue, rightSize, leftQueue, rawLeftIter)
-            case GpuBuildLeft =>
-              buildTime += leftTime.value
-              streamTime += rightTime.value
-              (leftQueue, leftSize, rightQueue, rawRightIter)
-          }
-          metrics(BUILD_DATA_SIZE).set(buildSize)
-          val baseBuildIter = setupForJoin(buildQueue, Iterator.empty, exprs.buildTypes,
-            gpuBatchSizeBytes, metrics)
-          val buildIter = if (exprs.buildSideNeedsNullFilter) {
-            new NullFilteredBatchIterator(baseBuildIter, exprs.boundBuildKeys, metrics(OP_TIME))
           } else {
-            baseBuildIter
+            val (streamRows, streamSize) = fetchTargetSize(naturalStreamIter,
+              naturalStreamQueue, gpuBatchSizeBytes)
+            if (streamRows < Int.MaxValue && streamSize < gpuBatchSizeBytes) {
+              flip_the_join_here
+            } else {
+              setup_the_join_here
+            }
           }
-          val streamIter = new CollectTimeIterator("fetch join stream",
-            setupForJoin(streamQueue, rawStreamIter, exprs.streamTypes, gpuBatchSizeBytes, metrics),
-            streamTime)
-          JoinInfo(joinType, buildSide, buildIter, buildSize, None, streamIter, exprs)
         }
       }
     }
@@ -396,6 +424,26 @@ object GpuShuffledSymmetricHashJoinExec {
         }
       }
       (totalRows, totalSize)
+    }
+
+    private def getSingleBatch(
+        queue: mutable.Queue[T],
+        boundKeys: Seq[GpuExpression],
+        types: Array[DataType],
+        targetSize: Long,
+        needsNullFilter: Boolean,
+        metrics: Map[String, GpuMetric]): ColumnarBatch = {
+      val baseIter = setupForJoin(queue, Iterator.empty, types, targetSize, metrics)
+      val iter = if (needsNullFilter) {
+        new NullFilteredBatchIterator(baseIter, boundKeys, metrics(OP_TIME))
+      } else {
+        baseIter
+      }
+      val batch = iter.next()
+      closeOnExcept(batch) { _ =>
+        assert(!iter.hasNext)
+      }
+      batch
     }
   }
 

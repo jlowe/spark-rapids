@@ -264,16 +264,20 @@ object GpuHashJoin {
 case class JoinBuildSideStats(streamMagnificationFactor: Double, isDistinct: Boolean)
 
 object JoinBuildSideStats {
-  def fromBuildKeys(buildKeys: ColumnarBatch): JoinBuildSideStats = {
-    // Based off of the keys on the build side guess at how many output rows there
-    // will be for each input row on the stream side. This does not take into account
-    // the join type, data skew or even if the keys actually match.
-    val builtCount = withResource(GpuColumnVector.from(buildKeys)) { keysTable =>
-      keysTable.distinctCount(NullEquality.EQUAL)
+  // TODO: Make boundBuildKeys Seq[GpuExpression]
+  def fromBatch(batch: ColumnarBatch, boundBuildKeys: Seq[Expression]): JoinBuildSideStats = {
+    // This is okay because the build keys must be deterministic
+    withResource(GpuProjectExec.project(batch, boundBuildKeys)) { buildKeys =>
+      // Based off of the keys on the build side guess at how many output rows there
+      // will be for each input row on the stream side. This does not take into account
+      // the join type, data skew or even if the keys actually match.
+      val builtCount = withResource(GpuColumnVector.from(buildKeys)) { keysTable =>
+        keysTable.distinctCount(NullEquality.EQUAL)
+      }
+      val isDistinct = builtCount == buildKeys.numRows()
+      val magnificationFactor = buildKeys.numRows().toDouble / builtCount
+      JoinBuildSideStats(magnificationFactor, isDistinct)
     }
-    val isDistinct = builtCount == buildKeys.numRows()
-    val magnificationFactor = buildKeys.numRows().toDouble / builtCount
-    JoinBuildSideStats(magnificationFactor, isDistinct)
   }
 }
 
@@ -304,10 +308,7 @@ abstract class BaseHashJoinIterator(
         built.checkpoint()
         withRetryNoSplit {
           withRestoreOnRetry(built) {
-            // This is okay because the build keys must be deterministic
-            withResource(GpuProjectExec.project(built.getBatch, boundBuiltKeys)) { builtKeys =>
-              JoinBuildSideStats.fromBuildKeys(builtKeys)
-            }
+            JoinBuildSideStats.fromBatch(built.getBatch, boundBuiltKeys)
           }
         }
       case _ =>
