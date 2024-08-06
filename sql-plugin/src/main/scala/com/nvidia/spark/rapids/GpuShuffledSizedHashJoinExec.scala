@@ -76,20 +76,32 @@ object GpuShuffledSizedHashJoinExec {
       buildSideNeedsNullFilter: Boolean) {
     def flipped(
         joinType: JoinType,
+        buildSide: GpuBuildSide,
         condition: Option[Expression]): BoundJoinExprs = {
-      val flippedCondition = condition.map { c =>
-        GpuBindReferences.bindGpuReference(c, buildOutput ++ streamOutput)
+      val (conditionLeftAttrs, conditionRightAttrs) = buildSide match {
+        case GpuBuildLeft => (streamOutput, buildOutput)
+        case GpuBuildRight => (buildOutput, streamOutput)
       }
-      // For join types other than FullOuter, we simply set compareNullsEqual as true to adapt
-      // struct keys with nullable children. Non-nested keys can also be correctly processed with
-      // compareNullsEqual = true, because we filter all null records from build table before join.
+      val flippedCondition = condition.map { c =>
+        GpuBindReferences.bindGpuReference(c, conditionLeftAttrs ++ conditionRightAttrs)
+      }
+      // For join types other than FullOuter and outer joins where the build side matches the
+      // outer side, we simply set compareNullsEqual as true to adapt struct keys with nullable
+      // children. Non-nested keys can also be correctly processed with compareNullsEqual = true,
+      // because we filter all null records from build table before join.
+      // For full outer and outer joins with build side matching outer side, we need to keep the
+      // nulls in the build table and thus cannot compare nulls as equal.
       // For details, see https://github.com/NVIDIA/spark-rapids/issues/2126.
-      val treatNullsEqual = (joinType != FullOuter) &&
-        GpuHashJoin.anyNullableStructChild(boundStreamKeys)
+      val treatNullsEqual = joinType match {
+        case FullOuter => false
+        case LeftOuter if buildSide == GpuBuildLeft => false
+        case RightOuter if buildSide == GpuBuildRight => false
+        case _ => GpuHashJoin.anyNullableStructChild(boundStreamKeys)
+      }
       val needNullFilter = treatNullsEqual && boundStreamKeys.exists(_.nullable)
       BoundJoinExprs(boundStreamKeys, streamTypes, streamOutput,
         boundBuildKeys, buildTypes, buildOutput,
-        flippedCondition, buildOutput.size, treatNullsEqual, needNullFilter)
+        flippedCondition, conditionLeftAttrs.size, treatNullsEqual, needNullFilter)
     }
   }
 
@@ -808,9 +820,11 @@ object GpuShuffledAsymmetricHashJoinExec {
                 val (streamRows, streamSize) = streamInfoProvider()
                 if (streamRows <= Int.MaxValue && streamSize <= gpuBatchSizeBytes) {
                   assert(!probeStreamIter.hasNext, "stream side not exhausted")
+                  // cannot filter out the nulls on the stream-side since they need to be
+                  // preserved in the outer join
                   val streamBatch = getSingleBatch(streamQueue, exprs.boundStreamKeys,
-                    exprs.streamTypes, gpuBatchSizeBytes, exprs.buildSideNeedsNullFilter,
-                    metrics)
+                    exprs.streamTypes, gpuBatchSizeBytes, needsNullFilter = false,
+                    metrics = metrics)
                   val streamIter = new SingleGpuColumnarBatchIterator(streamBatch)
                   val streamStats = JoinBuildSideStats.fromBatch(streamBatch, exprs.boundStreamKeys)
                   if (buildStats.streamMagnificationFactor <
@@ -822,7 +836,7 @@ object GpuShuffledAsymmetricHashJoinExec {
                     metrics(BUILD_DATA_SIZE).set(streamSize)
                     val flippedSide = flipped(buildSide)
                     JoinInfo(joinType, flippedSide, streamIter, streamSize, Some(streamStats),
-                      buildIter, exprs.flipped(joinType, condition))
+                      buildIter, exprs.flipped(joinType, flippedSide, condition))
                   }
                 } else {
                   metrics(BUILD_DATA_SIZE).set(buildSize)
@@ -845,7 +859,7 @@ object GpuShuffledAsymmetricHashJoinExec {
               metrics(BUILD_DATA_SIZE).set(streamSize)
               val flippedSide = flipped(buildSide)
               JoinInfo(joinType, flippedSide, streamIter, streamSize, None, buildIter,
-                exprs.flipped(joinType, condition))
+                exprs.flipped(joinType, flippedSide, condition))
             } else {
               JoinInfo(joinType, buildSide, buildIter, buildSize, None, streamIter, exprs)
             }
