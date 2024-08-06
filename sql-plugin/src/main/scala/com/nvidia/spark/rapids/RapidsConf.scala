@@ -665,14 +665,14 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
 
   val USE_SHUFFLED_SYMMETRIC_HASH_JOIN = conf("spark.rapids.sql.join.useShuffledSymmetricHashJoin")
     .doc("Use the experimental shuffle symmetric hash join designed to improve handling of large " +
-      "joins. Requires spark.rapids.sql.shuffledHashJoin.optimizeShuffle=true.")
+      "symmetric joins. Requires spark.rapids.sql.shuffledHashJoin.optimizeShuffle=true.")
     .internal()
     .booleanConf
     .createWithDefault(true)
 
-  val USE_SHUFFLED_SYMMETRIC_HASH_JOIN_LEFT_RIGHT_OUTER =
-    conf("spark.rapids.sql.join.useShuffledSymmetricHashJoinLeftRightOuter")
-      .doc("Use the experimental shuffle symmetric hash join designed to improve handling of " +
+  val USE_SHUFFLED_ASYMMETRIC_HASH_JOIN =
+    conf("spark.rapids.sql.join.useShuffledAsymmetricHashJoin")
+      .doc("Use the experimental shuffle asymmetric hash join designed to improve handling of " +
         "large joins for left and right outer joins. Requires " +
         "spark.rapids.sql.shuffledHashJoin.optimizeShuffle=true and " +
         "spark.rapids.sql.join.useShuffledSymmetricHashJoin=true")
@@ -2599,8 +2599,10 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val useShuffledSymmetricHashJoin: Boolean = get(USE_SHUFFLED_SYMMETRIC_HASH_JOIN)
 
-  lazy val useShuffledSymmetricHashJoinLeftRightOuter: Boolean =
-    get(USE_SHUFFLED_SYMMETRIC_HASH_JOIN_LEFT_RIGHT_OUTER)
+  lazy val useShuffledAsymmetricHashJoin: Boolean =
+    get(USE_SHUFFLED_ASYMMETRIC_HASH_JOIN)
+
+  lazy val joinOuterMagnificationThreshold: Int = get(JOIN_OUTER_MAGNIFICATION_THRESHOLD)
 
   lazy val stableSort: Boolean = get(STABLE_SORT)
 

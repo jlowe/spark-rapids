@@ -1200,15 +1200,16 @@ def test_distinct_join(join_type, batch_size):
     assert_gpu_and_cpu_are_equal_collect(do_join, conf=join_conf)
 
 @ignore_order(local=True)
-@pytest.mark.parametrize("join_type", ["Inner", "FullOuter"], ids=idfn)
+@pytest.mark.parametrize("join_type", ["Inner", "FullOuter", "LeftOuter", "RightOuter"], ids=idfn)
 @pytest.mark.parametrize("is_left_host_shuffle", [False, True], ids=idfn)
 @pytest.mark.parametrize("is_right_host_shuffle", [False, True], ids=idfn)
 @pytest.mark.parametrize("is_left_smaller", [False, True], ids=idfn)
 @pytest.mark.parametrize("batch_size", ["1024", "1g"], ids=idfn)
-def test_new_symmetric_join(join_type, is_left_host_shuffle, is_right_host_shuffle,
-                            is_left_smaller, batch_size):
+def test_sized_join(join_type, is_left_host_shuffle, is_right_host_shuffle,
+                    is_left_smaller, batch_size):
     join_conf = {
         "spark.rapids.sql.join.useShuffledSymmetricHashJoin": "true",
+        "spark.rapids.sql.join.useShuffledAsymmetricHashJoin": "true",
         "spark.sql.autoBroadcastJoinThreshold": "1",
         "spark.rapids.sql.batchSizeBytes": batch_size
     }
@@ -1236,15 +1237,17 @@ def test_new_symmetric_join(join_type, is_left_host_shuffle, is_right_host_shuff
     assert_gpu_and_cpu_are_equal_collect(do_join, conf=join_conf)
 
 @ignore_order(local=True)
-@pytest.mark.parametrize("join_type", ["Inner", "FullOuter"], ids=idfn)
+@pytest.mark.parametrize("join_type", ["Inner", "FullOuter", "LeftOuter", "RightOuter"], ids=idfn)
 @pytest.mark.parametrize("is_left_smaller", [False, True], ids=idfn)
 @pytest.mark.parametrize("is_ast_supported", [False, True], ids=idfn)
 @pytest.mark.parametrize("batch_size", ["1024", "1g"], ids=idfn)
-def test_new_symmetric_join_conditional(join_type, is_ast_supported, is_left_smaller, batch_size):
-    if join_type == "FullOuter" and not is_ast_supported:
-        pytest.skip("Full outer joins do not support a non-AST condition")
+def test_sized_join_conditional(join_type, is_ast_supported, is_left_smaller, batch_size):
+    if join_type != "Inner" and not is_ast_supported:
+        pytest.skip("Only inner joins support a non-AST condition")
     join_conf = {
         "spark.rapids.sql.join.useShuffledSymmetricHashJoin": "true",
+        "spark.rapids.sql.join.useShuffledAsymmetricHashJoin": "true",
+        "spark.rapids.sql.join.use"
         "spark.sql.autoBroadcastJoinThreshold": "1",
         "spark.rapids.sql.batchSizeBytes": batch_size
     }
@@ -1267,3 +1270,28 @@ def test_new_symmetric_join_conditional(join_type, is_ast_supported, is_left_sma
             cond.append(left_df.ints >= f.log(right_df.ints))
         return left_df.join(right_df, cond, join_type)
     assert_gpu_and_cpu_are_equal_collect(do_join, conf=join_conf)
+
+@pytest.mark.parametrize("join_type", ["LeftOuter", "RightOuter"], ids=idfn)
+@pytest.mark.parametrize("is_left_smaller", [False, True], ids=idfn)
+@pytest.mark.parametrize("is_conditional", [False, True], ids=idfn)
+def test_sized_join_high_key_replication(join_type, is_left_smaller, is_conditional):
+    join_conf = {
+        "spark.rapids.sql.join.useShuffledSymmetricHashJoin": "true",
+        "spark.rapids.sql.join.useShuffledAsymmetricHashJoin": "true",
+        "spark.rapids.sql.join.use"
+        "spark.sql.autoBroadcastJoinThreshold": "1"
+    }
+    left_size, right_size = (30000, 40000) if is_left_smaller else (40000, 30000)
+    def do_join(spark):
+        left_df = gen_df(spark, [
+            ("key1", RepeatSeqGen([1, 2, 3, 4, 5, 6, 7, None], data_type=IntegerType())),
+            ("ints", RepeatSeqGen(IntegerGen(), length = 5)),
+            ("floats", float_gen)], left_size)
+        right_df = gen_df(spark, [
+            ("ints", int_gen),
+            ("key1", RepeatSeqGen([1, None], data_type=IntegerType()))], right_size)
+        cond = [left_df.key1 == right_df.key1]
+        if is_conditional:
+            cond.append(left_df.ints >= right_df.ints)
+        return left_df.join(right_df, cond, join_type)
+    assert_gpu_and_cpu_row_counts_equal(do_join, conf=join_conf)
