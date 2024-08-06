@@ -1274,7 +1274,9 @@ def test_sized_join_conditional(join_type, is_ast_supported, is_left_smaller, ba
 @pytest.mark.parametrize("join_type", ["LeftOuter", "RightOuter"], ids=idfn)
 @pytest.mark.parametrize("is_left_replicated", [False, True], ids=idfn)
 @pytest.mark.parametrize("is_conditional", [False, True], ids=idfn)
-def test_sized_join_high_key_replication(join_type, is_left_replicated, is_conditional):
+@pytest.mark.parametrize("is_outer_side_small", [False, True], ids=idfn)
+def test_sized_join_high_key_replication(join_type, is_left_replicated, is_conditional,
+                                         is_outer_side_small):
     join_conf = {
         "spark.rapids.sql.join.useShuffledSymmetricHashJoin": "true",
         "spark.rapids.sql.join.useShuffledAsymmetricHashJoin": "true",
@@ -1287,6 +1289,12 @@ def test_sized_join_high_key_replication(join_type, is_left_replicated, is_condi
         RepeatSeqGen([1, None], data_type=IntegerType()))
     if is_left_replicated:
         left_key_gen, right_key_gen = (right_key_gen, left_key_gen)
+    if is_outer_side_small:
+        join_conf["spark.rapids.sql.batchSizeBytes"] = "131072"
+        if join_type == "LeftOuter":
+            left_size = 100
+        else:
+            right_size = 100
     def do_join(spark):
         left_df = gen_df(spark, [
             ("key1", left_key_gen),
@@ -1298,8 +1306,5 @@ def test_sized_join_high_key_replication(join_type, is_left_replicated, is_condi
         cond = [left_df.key1 == right_df.key2]
         if is_conditional:
             cond.append(left_df.ints >= right_df.ints2)
-        df = left_df.join(right_df, cond, join_type)
-        is_gpu = spark.conf.get("spark.rapids.sql.enabled") == "true"
-        #df.write.parquet("/tmp/joinresult-" + str(is_gpu))
-        return df
+        return left_df.join(right_df, cond, join_type)
     assert_gpu_and_cpu_row_counts_equal(do_join, conf=join_conf)
