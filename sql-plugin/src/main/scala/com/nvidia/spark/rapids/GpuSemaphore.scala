@@ -353,7 +353,14 @@ private final class GpuSemaphore() extends Logging {
     }
   }
 
-  def isAcquired(context: TaskContext): Boolean = tasks.contains(context.taskAttemptId())
+  def isAcquired(context: TaskContext): Boolean = {
+    val taskInfo = tasks.get(context.taskAttemptId());
+    if (taskInfo != null) {
+      taskInfo.isHoldingSemaphore
+    } else {
+      false
+    }
+  }
 
   def acquireIfNecessary(context: TaskContext): Unit = {
     // Make sure that the thread/task is registered before we try and block
