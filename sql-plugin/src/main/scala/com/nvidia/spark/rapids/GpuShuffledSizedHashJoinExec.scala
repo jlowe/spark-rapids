@@ -18,7 +18,7 @@ package com.nvidia.spark.rapids
 
 import scala.collection.{mutable, BitSet}
 
-import ai.rapids.cudf.{ContiguousTable, HostMemoryBuffer}
+import ai.rapids.cudf.{ContiguousTable, HostMemoryBuffer, NvtxColor, NvtxRange}
 import ai.rapids.cudf.JCudfSerialization.SerializedTableHeader
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.GpuMetric._
@@ -31,12 +31,12 @@ import com.nvidia.spark.rapids.shims.GpuHashPartitioning
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression}
-import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, InnerLike, JoinType, LeftOuter, RightOuter}
+import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.physical.Distribution
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.adaptive.ShuffleQueryStageExec
 import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
-import org.apache.spark.sql.rapids.execution.{ConditionalHashJoinIterator, GpuCustomShuffleReaderExec, GpuHashJoin, GpuJoinExec, GpuShuffleExchangeExecBase, HashJoinIterator, HashJoinStreamSideIterator, HashOuterJoinIterator, JoinBuildSideStats}
+import org.apache.spark.sql.rapids.execution._
 import org.apache.spark.sql.types.DataType
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
@@ -240,8 +240,10 @@ object GpuShuffledSizedHashJoinExec {
           new HostQueueBatchIterator(queue, remainingIter),
           gpuBatchSizeBytes,
           concatMetrics))
-      // Force a coalesce of the first batch before we grab the GPU semaphore
-      bufferedCoalesceIter.headOption
+      withResource(new NvtxRange("fetch first batch", NvtxColor.YELLOW)) { _ =>
+        // Force a coalesce of the first batch before we grab the GPU semaphore
+        bufferedCoalesceIter.headOption
+      }
       new GpuShuffleCoalesceIterator(bufferedCoalesceIter, batchTypes, concatMetrics)
     }
 
@@ -902,20 +904,22 @@ object GpuShuffledAsymmetricHashJoinExec {
         iter: Iterator[T],
         queue: mutable.Queue[T],
         targetSize: Long): (Long, Long) = {
-      var totalRows: Long = 0
-      var totalSize: Long = 0L
-      while (totalRows <= Integer.MAX_VALUE && totalSize <= targetSize && iter.hasNext) {
-        val batch = iter.next()
-        val rowCount = getProbeBatchRowCount(batch)
-        if (rowCount > 0) {
-          queue += batch
-          totalRows += rowCount
-          totalSize += getProbeBatchDataSize(batch)
-        } else {
-          batch.close()
+      withResource(new NvtxRange("asymmetric join probe fetch", NvtxColor.YELLOW)) { _ =>
+        var totalRows: Long = 0
+        var totalSize: Long = 0L
+        while (totalRows <= Integer.MAX_VALUE && totalSize <= targetSize && iter.hasNext) {
+          val batch = iter.next()
+          val rowCount = getProbeBatchRowCount(batch)
+          if (rowCount > 0) {
+            queue += batch
+            totalRows += rowCount
+            totalSize += getProbeBatchDataSize(batch)
+          } else {
+            batch.close()
+          }
         }
+        (totalRows, totalSize)
       }
-      (totalRows, totalSize)
     }
 
     /**
@@ -929,20 +933,22 @@ object GpuShuffledAsymmetricHashJoinExec {
         iter: Iterator[ColumnarBatch],
         queue: mutable.Queue[SpillableColumnarBatch],
         targetSize: Long): (Long, Long) = {
-      var totalRows: Long = 0
-      var totalSize: Long = 0L
-      while (totalRows <= Integer.MAX_VALUE && totalSize <= targetSize && iter.hasNext) {
-        val batch = iter.next()
-        val rowCount = batch.numRows()
-        if (rowCount > 0) {
-          totalRows += rowCount
-          totalSize += GpuColumnVector.getTotalDeviceMemoryUsed(batch)
-          queue += SpillableColumnarBatch(batch, SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
-        } else {
-          batch.close()
+      withResource(new NvtxRange("asymmetric join fetch", NvtxColor.YELLOW)) { _ =>
+        var totalRows: Long = 0
+        var totalSize: Long = 0L
+        while (totalRows <= Integer.MAX_VALUE && totalSize <= targetSize && iter.hasNext) {
+          val batch = iter.next()
+          val rowCount = batch.numRows()
+          if (rowCount > 0) {
+            totalRows += rowCount
+            totalSize += GpuColumnVector.getTotalDeviceMemoryUsed(batch)
+            queue += SpillableColumnarBatch(batch, SpillPriorities.ACTIVE_ON_DECK_PRIORITY)
+          } else {
+            batch.close()
+          }
         }
+        (totalRows, totalSize)
       }
-      (totalRows, totalSize)
     }
 
     private def addNullFilterIfNecessary(
@@ -1007,8 +1013,8 @@ case class GpuShuffledAsymmetricHashJoinExec(
     override val cpuLeftKeys: Seq[Expression],
     override val cpuRightKeys: Seq[Expression],
     magnificationThreshold: Integer) extends GpuShuffledSizedHashJoinExec {
-  import GpuShuffledSizedHashJoinExec.JoinSizer
   import GpuShuffledAsymmetricHashJoinExec._
+  import GpuShuffledSizedHashJoinExec.JoinSizer
 
   override def otherCopyArgs: Seq[AnyRef] = Seq(cpuLeftKeys, cpuRightKeys, magnificationThreshold)
 
