@@ -771,12 +771,13 @@ object GpuShuffledAsymmetricHashJoinExec {
               GpuBuildLeft)
           case _ => throw new IllegalStateException(s"unexpected join type $joinType")
         }
-
+      val exprs = BoundJoinExprs.bind(joinType, leftKeys, leftOutput, rightKeys,
+        rightOutput, condition, buildSide)
       closeOnExcept(mutable.Queue.empty[T]) { buildQueue =>
-        val exprs = BoundJoinExprs.bind(joinType, leftKeys, leftOutput, rightKeys,
-          rightOutput, condition, buildSide)
         val (buildRows, buildSize) = fetchTargetSize(probeBuildIter, buildQueue,
           gpuBatchSizeBytes)
+        val baseBuildIter = setupForJoin(buildQueue, rawBuildIter, exprs.buildTypes,
+          gpuBatchSizeBytes, metrics)
         if (buildRows <= Int.MaxValue && buildSize <= gpuBatchSizeBytes) {
           assert(!probeBuildIter.hasNext, "build side not exhausted")
           val streamIter = setupForJoin(mutable.Queue.empty, rawStreamIter, exprs.streamTypes,
@@ -787,17 +788,10 @@ object GpuShuffledAsymmetricHashJoinExec {
           if (buildRows < magnificationThreshold) {
             // impossible for build-side to exceed magnification threshold with so few rows
             metrics(BUILD_DATA_SIZE).set(buildSize)
-            val baseBuildIter = setupForJoin(buildQueue, Iterator.empty, exprs.buildTypes,
-              gpuBatchSizeBytes, metrics)
-            val buildIter = if (exprs.buildSideNeedsNullFilter) {
-              new NullFilteredBatchIterator(baseBuildIter, exprs.boundBuildKeys, metrics(OP_TIME))
-            } else {
-              baseBuildIter
-            }
+            val buildIter = addNullFilterIfNecessary(baseBuildIter, exprs.boundBuildKeys,
+              exprs.buildSideNeedsNullFilter, metrics)
             JoinInfo(joinType, buildSide, buildIter, buildSize, None, streamIter, exprs)
           } else {
-            val baseBuildIter = setupForJoin(buildQueue, Iterator.empty, exprs.buildTypes,
-              gpuBatchSizeBytes, metrics)
             val buildBatch = getSingleBatch(baseBuildIter, exprs.boundBuildKeys,
               exprs.buildSideNeedsNullFilter, metrics)
             val buildIter = new SingleGpuColumnarBatchIterator(buildBatch)
@@ -850,8 +844,6 @@ object GpuShuffledAsymmetricHashJoinExec {
             }
           }
         } else {
-          val buildIter = setupForJoin(buildQueue, rawBuildIter, exprs.buildTypes,
-            gpuBatchSizeBytes, metrics)
           val streamQueue = mutable.Queue.empty[T]
           val (streamRows, streamSize) = closeOnExcept(streamQueue) { _ =>
             fetchTargetSize(probeStreamIter, streamQueue, gpuBatchSizeBytes)
@@ -862,9 +854,11 @@ object GpuShuffledAsymmetricHashJoinExec {
             assert(!probeStreamIter.hasNext, "stream side not exhausted")
             metrics(BUILD_DATA_SIZE).set(streamSize)
             val flippedSide = flipped(buildSide)
-            JoinInfo(joinType, flippedSide, streamIter, streamSize, None, buildIter,
+            JoinInfo(joinType, flippedSide, streamIter, streamSize, None, baseBuildIter,
               exprs.flipped(joinType, flippedSide, condition))
           } else {
+            val buildIter = addNullFilterIfNecessary(baseBuildIter, exprs.boundBuildKeys,
+              exprs.buildSideNeedsNullFilter, metrics)
             JoinInfo(joinType, buildSide, buildIter, buildSize, None, streamIter, exprs)
           }
         }
@@ -917,16 +911,24 @@ object GpuShuffledAsymmetricHashJoinExec {
       (totalRows, totalSize)
     }
 
+    private def addNullFilterIfNecessary(
+        buildIter: Iterator[ColumnarBatch],
+        boundKeys: Seq[GpuExpression],
+        needsNullFilter: Boolean,
+        metrics: Map[String, GpuMetric]): Iterator[ColumnarBatch] = {
+      if (needsNullFilter) {
+        new NullFilteredBatchIterator(buildIter, boundKeys, metrics(OP_TIME))
+      } else {
+        buildIter
+      }
+    }
+
     private def getSingleBatch(
         baseIter: Iterator[ColumnarBatch],
         boundKeys: Seq[GpuExpression],
         needsNullFilter: Boolean,
         metrics: Map[String, GpuMetric]): ColumnarBatch = {
-      val iter = if (needsNullFilter) {
-        new NullFilteredBatchIterator(baseIter, boundKeys, metrics(OP_TIME))
-      } else {
-        baseIter
-      }
+      val iter = addNullFilterIfNecessary(baseIter, boundKeys, needsNullFilter, metrics)
       val batch = iter.next()
       closeOnExcept(batch) { _ =>
         assert(!iter.hasNext)

@@ -90,15 +90,6 @@ object GpuSemaphore {
     }
   }
 
-  def isAcquired(context: TaskContext): Boolean = {
-    if (context != null) {
-      getInstance.isAcquired(context)
-    } else {
-      // For unit tests that might try with no context
-      true
-    }
-  }
-
   /**
    * Tasks must call this when they begin to use the GPU.
    * If the task has not already acquired the GPU semaphore then it is acquired,
@@ -350,15 +341,6 @@ private final class GpuSemaphore() extends Logging {
         }
       }
       AcquireFailed(numWaiting)
-    }
-  }
-
-  def isAcquired(context: TaskContext): Boolean = {
-    val taskInfo = tasks.get(context.taskAttemptId());
-    if (taskInfo != null) {
-      taskInfo.isHoldingSemaphore
-    } else {
-      false
     }
   }
 
