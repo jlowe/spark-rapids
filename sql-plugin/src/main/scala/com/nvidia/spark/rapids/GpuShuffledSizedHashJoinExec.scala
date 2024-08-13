@@ -257,6 +257,44 @@ object GpuShuffledSizedHashJoinExec {
   }
 
   /**
+   * Very similar to the HostHostJoinSizer except it does not support host spillable
+   * data. This should only be used when the amount of data being probed is the
+   * target batch size or less, which matches the behavior of normal shuffle processing
+   * today. Ideally we should be using HostHostJoinSizer, but this saves the overhead
+   * of registering and unregistering all of the shuffle buffers with the spill framework.
+   * See https://github.com/NVIDIA/spark-rapids/issues/11322.
+   */
+  trait HostHostUnspillableJoinSizer extends JoinSizer[ColumnarBatch] {
+    override def setupForProbe(
+        iter: Iterator[ColumnarBatch]): Iterator[ColumnarBatch] = iter
+
+    override def setupForJoin(
+        queue: mutable.Queue[ColumnarBatch],
+        remainingIter: Iterator[ColumnarBatch],
+        batchTypes: Array[DataType],
+        gpuBatchSizeBytes: Long,
+        metrics: Map[String, GpuMetric]): Iterator[ColumnarBatch] = {
+      val concatMetrics = getConcatMetrics(metrics)
+      val bufferedCoalesceIter = new CloseableBufferedIterator(
+        new HostShuffleCoalesceIterator(
+          queue.iterator ++ remainingIter,
+          gpuBatchSizeBytes,
+          concatMetrics))
+      withResource(new NvtxRange("fetch first batch", NvtxColor.YELLOW)) { _ =>
+        // Force a coalesce of the first batch before we grab the GPU semaphore
+        bufferedCoalesceIter.headOption
+      }
+      new GpuShuffleCoalesceIterator(bufferedCoalesceIter, batchTypes, concatMetrics)
+    }
+
+    override def getProbeBatchRowCount(batch: ColumnarBatch): Long = batch.numRows()
+
+    override def getProbeBatchDataSize(batch: ColumnarBatch): Long = {
+      SerializedTableColumn.getMemoryUsed(batch)
+    }
+  }
+
+  /**
    * Join sizer to use when at least one side of the join is coming from another GPU exec node
    * such that the GPU semaphore is already held. Caches input batches on the GPU.
    *
@@ -329,7 +367,7 @@ object GpuShuffledSizedHashJoinExec {
   }
 }
 
-abstract class GpuShuffledSizedHashJoinExec extends GpuJoinExec {
+abstract class GpuShuffledSizedHashJoinExec[HOST_TYPE <: AutoCloseable] extends GpuJoinExec {
   import GpuShuffledSizedHashJoinExec._
 
   def left: SparkPlan
@@ -340,7 +378,7 @@ abstract class GpuShuffledSizedHashJoinExec extends GpuJoinExec {
   def cpuLeftKeys: Seq[Expression]
   def cpuRightKeys: Seq[Expression]
 
-  protected def createHostHostSizer(): JoinSizer[SpillableHostConcatResult]
+  protected def createHostHostSizer(): JoinSizer[HOST_TYPE]
 
   protected def createSpillableColumnarBatchSizer(
       startWithLeftSide: Boolean): JoinSizer[SpillableColumnarBatch]
@@ -691,7 +729,7 @@ object GpuShuffledSymmetricHashJoinExec {
   }
 
   class HostHostSymmetricJoinSizer extends SymmetricJoinSizer[SpillableHostConcatResult]
-    with HostHostJoinSizer {
+      with HostHostJoinSizer {
     override val startWithLeftSide: Boolean = true
   }
 
@@ -726,7 +764,8 @@ case class GpuShuffledSymmetricHashJoinExec(
     override val gpuBatchSizeBytes: Long,
     override val isSkewJoin: Boolean)(
     override val cpuLeftKeys: Seq[Expression],
-    override val cpuRightKeys: Seq[Expression]) extends GpuShuffledSizedHashJoinExec {
+    override val cpuRightKeys: Seq[Expression])
+    extends GpuShuffledSizedHashJoinExec[SpillableHostConcatResult] {
   import GpuShuffledSizedHashJoinExec.JoinSizer
   import GpuShuffledSymmetricHashJoinExec._
 
@@ -977,7 +1016,7 @@ object GpuShuffledAsymmetricHashJoinExec {
   }
 
   class HostHostAsymmetricJoinSizer(override val magnificationThreshold: Int)
-    extends AsymmetricJoinSizer[SpillableHostConcatResult] with HostHostJoinSizer {
+    extends AsymmetricJoinSizer[ColumnarBatch] with HostHostUnspillableJoinSizer {
   }
 
   class SpillableColumnarBatchAsymmetricJoinSizer(override val magnificationThreshold: Int)
@@ -1012,13 +1051,13 @@ case class GpuShuffledAsymmetricHashJoinExec(
     override val isSkewJoin: Boolean)(
     override val cpuLeftKeys: Seq[Expression],
     override val cpuRightKeys: Seq[Expression],
-    magnificationThreshold: Integer) extends GpuShuffledSizedHashJoinExec {
+    magnificationThreshold: Integer) extends GpuShuffledSizedHashJoinExec[ColumnarBatch] {
   import GpuShuffledAsymmetricHashJoinExec._
   import GpuShuffledSizedHashJoinExec.JoinSizer
 
   override def otherCopyArgs: Seq[AnyRef] = Seq(cpuLeftKeys, cpuRightKeys, magnificationThreshold)
 
-  override protected def createHostHostSizer(): JoinSizer[SpillableHostConcatResult] = {
+  override protected def createHostHostSizer(): JoinSizer[ColumnarBatch] = {
     new HostHostAsymmetricJoinSizer(magnificationThreshold)
   }
 
