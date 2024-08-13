@@ -773,93 +773,113 @@ object GpuShuffledAsymmetricHashJoinExec {
         }
       val exprs = BoundJoinExprs.bind(joinType, leftKeys, leftOutput, rightKeys,
         rightOutput, condition, buildSide)
-      closeOnExcept(mutable.Queue.empty[T]) { buildQueue =>
-        val (buildRows, buildSize) = fetchTargetSize(probeBuildIter, buildQueue,
-          gpuBatchSizeBytes)
-        val baseBuildIter = setupForJoin(buildQueue, rawBuildIter, exprs.buildTypes,
+      val buildQueue = mutable.Queue.empty[T]
+      val (buildRows, buildSize) = closeOnExcept(buildQueue) { _ =>
+        fetchProbeTargetSize(probeBuildIter, buildQueue, gpuBatchSizeBytes)
+      }
+      val baseBuildIter = setupForJoin(buildQueue, rawBuildIter, exprs.buildTypes,
+        gpuBatchSizeBytes, metrics)
+      if (buildRows <= Int.MaxValue && buildSize <= gpuBatchSizeBytes) {
+        assert(!probeBuildIter.hasNext, "build side not exhausted")
+        getJoinInfoSmallBuildSide(joinType, buildSide, condition, exprs,
+          baseBuildIter, buildRows, buildSize,
+          rawStreamIter, gpuBatchSizeBytes, metrics)
+      } else {
+        // The natural build side does not fit in a single batch, so use the stream side
+        // as the hash table if we can fit it in a single batch.
+        val streamQueue = mutable.Queue.empty[T]
+        val (streamRows, streamSize) = closeOnExcept(streamQueue) { _ =>
+          fetchProbeTargetSize(probeStreamIter, streamQueue, gpuBatchSizeBytes)
+        }
+        val streamIter = setupForJoin(streamQueue, rawStreamIter, exprs.streamTypes,
           gpuBatchSizeBytes, metrics)
-        if (buildRows <= Int.MaxValue && buildSize <= gpuBatchSizeBytes) {
-          assert(!probeBuildIter.hasNext, "build side not exhausted")
-          val streamIter = setupForJoin(mutable.Queue.empty, rawStreamIter, exprs.streamTypes,
-            gpuBatchSizeBytes, metrics)
-          // The natural build side fits in the target batch size, but we might have performance
-          // problems if there are many duplicate keys in the build-side batch leading to a high
-          // magnification factor, see https://github.com/NVIDIA/spark-rapids/issues/7529
-          if (buildRows < magnificationThreshold) {
-            // impossible for build-side to exceed magnification threshold with so few rows
-            metrics(BUILD_DATA_SIZE).set(buildSize)
-            val buildIter = addNullFilterIfNecessary(baseBuildIter, exprs.boundBuildKeys,
-              exprs.buildSideNeedsNullFilter, metrics)
-            JoinInfo(joinType, buildSide, buildIter, buildSize, None, streamIter, exprs)
-          } else {
-            val buildBatch = getSingleBatch(baseBuildIter, exprs.boundBuildKeys,
-              exprs.buildSideNeedsNullFilter, metrics)
-            val buildIter = new SingleGpuColumnarBatchIterator(buildBatch)
-            val buildStats = JoinBuildSideStats.fromBatch(buildBatch, exprs.boundBuildKeys)
-            if (buildStats.streamMagnificationFactor < magnificationThreshold) {
-              metrics(BUILD_DATA_SIZE).set(buildSize)
-              JoinInfo(joinType, buildSide, buildIter, buildSize, Some(buildStats), streamIter,
-                exprs)
-            } else {
-              closeOnExcept(mutable.Queue.empty[SpillableColumnarBatch]) { streamQueue =>
-                val (streamRows, streamSize) =
-                  fetchTargetSizeColumnarBatch(streamIter, streamQueue, gpuBatchSizeBytes)
-                if (streamRows <= Int.MaxValue && streamSize <= gpuBatchSizeBytes) {
-                  assert(!probeStreamIter.hasNext, "stream side not exhausted")
-                  // cannot filter out the nulls on the stream-side since they need to be
-                  // preserved in the outer join
-                  val streamBatchIter = new GpuCoalesceIterator(
-                    new SpillableColumnarBatchQueueIterator(streamQueue, Iterator.empty),
-                    exprs.streamTypes,
-                    RequireSingleBatch,
-                    numInputRows = NoopMetric,
-                    numInputBatches = NoopMetric,
-                    numOutputRows = NoopMetric,
-                    numOutputBatches = NoopMetric,
-                    collectTime = NoopMetric,
-                    concatTime = metrics(CONCAT_TIME),
-                    opTime = metrics(OP_TIME),
-                    opName = "stream as build")
-                  val streamBatch = streamBatchIter.next()
-                  val streamIter = new SingleGpuColumnarBatchIterator(streamBatch)
-                  assert(!streamBatchIter.hasNext, "stream side not exhausted")
-                  val streamStats = JoinBuildSideStats.fromBatch(streamBatch, exprs.boundStreamKeys)
-                  if (buildStats.streamMagnificationFactor <
-                    streamStats.streamMagnificationFactor) {
-                    metrics(BUILD_DATA_SIZE).set(buildSize)
-                    JoinInfo(joinType, buildSide, buildIter, buildSize, Some(buildStats),
-                      streamIter, exprs)
-                  } else {
-                    metrics(BUILD_DATA_SIZE).set(streamSize)
-                    val flippedSide = flipped(buildSide)
-                    JoinInfo(joinType, flippedSide, streamIter, streamSize, Some(streamStats),
-                      buildIter, exprs.flipped(joinType, flippedSide, condition))
-                  }
-                } else {
-                  metrics(BUILD_DATA_SIZE).set(buildSize)
-                  JoinInfo(joinType, buildSide, buildIter, buildSize, Some(buildStats),
-                    new SpillableColumnarBatchQueueIterator(streamQueue, streamIter), exprs)
-                }
-              }
-            }
-          }
+        if (streamRows <= Int.MaxValue && streamSize <= gpuBatchSizeBytes) {
+          assert(!probeStreamIter.hasNext, "stream side not exhausted")
+          metrics(BUILD_DATA_SIZE).set(streamSize)
+          val flippedSide = flipped(buildSide)
+          JoinInfo(joinType, flippedSide, streamIter, streamSize, None, baseBuildIter,
+            exprs.flipped(joinType, flippedSide, condition))
         } else {
-          val streamQueue = mutable.Queue.empty[T]
-          val (streamRows, streamSize) = closeOnExcept(streamQueue) { _ =>
-            fetchTargetSize(probeStreamIter, streamQueue, gpuBatchSizeBytes)
-          }
-          val streamIter = setupForJoin(streamQueue, rawStreamIter, exprs.streamTypes,
-            gpuBatchSizeBytes, metrics)
-          if (streamRows <= Int.MaxValue && streamSize <= gpuBatchSizeBytes) {
-            assert(!probeStreamIter.hasNext, "stream side not exhausted")
-            metrics(BUILD_DATA_SIZE).set(streamSize)
-            val flippedSide = flipped(buildSide)
-            JoinInfo(joinType, flippedSide, streamIter, streamSize, None, baseBuildIter,
-              exprs.flipped(joinType, flippedSide, condition))
-          } else {
-            val buildIter = addNullFilterIfNecessary(baseBuildIter, exprs.boundBuildKeys,
-              exprs.buildSideNeedsNullFilter, metrics)
-            JoinInfo(joinType, buildSide, buildIter, buildSize, None, streamIter, exprs)
+          val buildIter = addNullFilterIfNecessary(baseBuildIter, exprs.boundBuildKeys,
+            exprs.buildSideNeedsNullFilter, metrics)
+          JoinInfo(joinType, buildSide, buildIter, buildSize, None, streamIter, exprs)
+        }
+      }
+    }
+
+    // Get the join info when the natural build side of the join can be a single batch.
+    private def getJoinInfoSmallBuildSide(
+        joinType: JoinType,
+        buildSide: GpuBuildSide,
+        condition: Option[Expression],
+        exprs: BoundJoinExprs,
+        baseBuildIter: Iterator[ColumnarBatch],
+        buildRows: Long,
+        buildSize: Long,
+        rawStreamIter: Iterator[ColumnarBatch],
+        gpuBatchSizeBytes: Long,
+        metrics: Map[String, GpuMetric]) = {
+      val streamIter = setupForJoin(mutable.Queue.empty, rawStreamIter, exprs.streamTypes,
+        gpuBatchSizeBytes, metrics)
+      // The natural build side fits in the target batch size, but we might have performance
+      // problems if there are many duplicate keys in the build-side batch leading to a high
+      // magnification factor, see https://github.com/NVIDIA/spark-rapids/issues/7529
+      if (buildRows < magnificationThreshold) {
+        // impossible for build-side to exceed magnification threshold with so few rows
+        metrics(BUILD_DATA_SIZE).set(buildSize)
+        val buildIter = addNullFilterIfNecessary(baseBuildIter, exprs.boundBuildKeys,
+          exprs.buildSideNeedsNullFilter, metrics)
+        JoinInfo(joinType, buildSide, buildIter, buildSize, None, streamIter, exprs)
+      } else {
+        val buildBatch = getSingleBuildBatch(baseBuildIter, exprs, metrics)
+        val buildIter = new SingleGpuColumnarBatchIterator(buildBatch)
+        val buildStats = JoinBuildSideStats.fromBatch(buildBatch, exprs.boundBuildKeys)
+        if (buildStats.streamMagnificationFactor < magnificationThreshold) {
+          metrics(BUILD_DATA_SIZE).set(buildSize)
+          JoinInfo(joinType, buildSide, buildIter, buildSize, Some(buildStats), streamIter,
+            exprs)
+        } else {
+          // The natural build side is explosive, so check the natural stream side to see
+          // if it should be used for the hash table instead.
+          closeOnExcept(mutable.Queue.empty[SpillableColumnarBatch]) { streamQueue =>
+            val (streamRows, streamSize) =
+              fetchTargetSize(streamIter, streamQueue, gpuBatchSizeBytes)
+            if (streamRows <= Int.MaxValue && streamSize <= gpuBatchSizeBytes) {
+              assert(!streamIter.hasNext, "stream side not exhausted")
+              // cannot filter out the nulls on the stream-side since they need to be
+              // preserved in the outer join
+              val streamBatchIter = new GpuCoalesceIterator(
+                new SpillableColumnarBatchQueueIterator(streamQueue, Iterator.empty),
+                exprs.streamTypes,
+                RequireSingleBatch,
+                numInputRows = NoopMetric,
+                numInputBatches = NoopMetric,
+                numOutputRows = NoopMetric,
+                numOutputBatches = NoopMetric,
+                collectTime = NoopMetric,
+                concatTime = metrics(CONCAT_TIME),
+                opTime = metrics(OP_TIME),
+                opName = "stream as build")
+              val streamBatch = streamBatchIter.next()
+              val singleStreamIter = new SingleGpuColumnarBatchIterator(streamBatch)
+              assert(!streamBatchIter.hasNext, "stream side not exhausted")
+              val streamStats = JoinBuildSideStats.fromBatch(streamBatch, exprs.boundStreamKeys)
+              if (buildStats.streamMagnificationFactor <
+                  streamStats.streamMagnificationFactor) {
+                metrics(BUILD_DATA_SIZE).set(buildSize)
+                JoinInfo(joinType, buildSide, buildIter, buildSize, Some(buildStats),
+                  singleStreamIter, exprs)
+              } else {
+                metrics(BUILD_DATA_SIZE).set(streamSize)
+                val flippedSide = flipped(buildSide)
+                JoinInfo(joinType, flippedSide, singleStreamIter, streamSize, Some(streamStats),
+                  buildIter, exprs.flipped(joinType, flippedSide, condition))
+              }
+            } else {
+              metrics(BUILD_DATA_SIZE).set(buildSize)
+              JoinInfo(joinType, buildSide, buildIter, buildSize, Some(buildStats),
+                new SpillableColumnarBatchQueueIterator(streamQueue, streamIter), exprs)
+            }
           }
         }
       }
@@ -871,7 +891,14 @@ object GpuShuffledAsymmetricHashJoinExec {
       case x => throw new IllegalStateException(s"unexpected build side: $x")
     }
 
-    private def fetchTargetSize(
+    /**
+     * Try to exhaust a probe iterator by fetching batches up to a specified target size.
+     * @param iter probe iterator to fetch from
+     * @param queue queue to place fetched batches into
+     * @param targetSize target size to limit fetching
+     * @return the total rows and total bytes fetched into the queue
+     */
+    private def fetchProbeTargetSize(
         iter: Iterator[T],
         queue: mutable.Queue[T],
         targetSize: Long): (Long, Long) = {
@@ -891,7 +918,14 @@ object GpuShuffledAsymmetricHashJoinExec {
       (totalRows, totalSize)
     }
 
-    private def fetchTargetSizeColumnarBatch(
+    /**
+     * Try to exhaust a join input iterator by fetching batches up to a specified target size.
+     * @param iter iterator to fetch from
+     * @param queue queue to place fetched batches into
+     * @param targetSize target size to limit fetching
+     * @return the total rows and total bytes fetched into the queue
+     */
+    private def fetchTargetSize(
         iter: Iterator[ColumnarBatch],
         queue: mutable.Queue[SpillableColumnarBatch],
         targetSize: Long): (Long, Long) = {
@@ -923,17 +957,16 @@ object GpuShuffledAsymmetricHashJoinExec {
       }
     }
 
-    private def getSingleBatch(
+    private def getSingleBuildBatch(
         baseIter: Iterator[ColumnarBatch],
-        boundKeys: Seq[GpuExpression],
-        needsNullFilter: Boolean,
+        exprs: BoundJoinExprs,
         metrics: Map[String, GpuMetric]): ColumnarBatch = {
-      val iter = addNullFilterIfNecessary(baseIter, boundKeys, needsNullFilter, metrics)
-      val batch = iter.next()
-      closeOnExcept(batch) { _ =>
+      val iter = addNullFilterIfNecessary(baseIter, exprs.boundBuildKeys,
+        exprs.buildSideNeedsNullFilter, metrics)
+      closeOnExcept(iter.next()) { batch =>
         assert(!iter.hasNext)
+        batch
       }
-      batch
     }
   }
 
