@@ -367,7 +367,7 @@ object GpuShuffledSizedHashJoinExec {
   }
 }
 
-abstract class GpuShuffledSizedHashJoinExec[HOST_TYPE <: AutoCloseable] extends GpuJoinExec {
+abstract class GpuShuffledSizedHashJoinExec[HOST_BATCH_TYPE <: AutoCloseable] extends GpuJoinExec {
   import GpuShuffledSizedHashJoinExec._
 
   def left: SparkPlan
@@ -378,7 +378,7 @@ abstract class GpuShuffledSizedHashJoinExec[HOST_TYPE <: AutoCloseable] extends 
   def cpuLeftKeys: Seq[Expression]
   def cpuRightKeys: Seq[Expression]
 
-  protected def createHostHostSizer(): JoinSizer[HOST_TYPE]
+  protected def createHostHostSizer(): JoinSizer[HOST_BATCH_TYPE]
 
   protected def createSpillableColumnarBatchSizer(
       startWithLeftSide: Boolean): JoinSizer[SpillableColumnarBatch]
