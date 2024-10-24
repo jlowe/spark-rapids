@@ -1417,14 +1417,23 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
   protected def calculateParquetOutputSize(
       currentChunkedBlocks: Seq[BlockMetaData],
       schema: MessageType,
-      handleCoalesceFiles: Boolean): Long = {
+      handleCoalesceFiles: Boolean,
+      isSnappyOnCpu: Boolean): Long = {
     // start with the size of Parquet magic (at start+end) and footer length values
     var size: Long = PARQUET_META_SIZE
 
     // Calculate the total amount of column data that will be copied
     // NOTE: Avoid using block.getTotalByteSize here as that is the
     //       uncompressed size rather than the size in the file.
-    size += currentChunkedBlocks.flatMap(_.getColumns.asScala.map(_.getTotalSize)).sum
+    size += currentChunkedBlocks.flatMap { block =>
+      block.getColumns.asScala.map { c =>
+        if (isSnappyOnCpu && c.getCodec == CompressionCodecName.SNAPPY) {
+          c.getTotalUncompressedSize
+        } else {
+          c.getTotalSize
+        }
+      }
+    }.sum
 
     val footerSize = calculateParquetFooterSize(currentChunkedBlocks, schema)
     val extraMemory = if (handleCoalesceFiles) {
@@ -1576,6 +1585,55 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
     computeBlockMetaData(blocks, realStartOffset)
   }
 
+  /**
+   * Copies the data corresponding to the clipped blocks in the original file and compute the
+   * block metadata for the output. The output blocks will contain the same column chunk
+   * metadata but with the file offsets updated to reflect the new position of the column data
+   * as written to the output.
+   *
+   * @param in  the input stream for the original Parquet file
+   * @param out the output stream to receive the data
+   * @param blocks block metadata from the original file that will appear in the computed file
+   * @param realStartOffset starting file offset of the first block
+   * @return updated block metadata corresponding to the output
+   */
+  protected def copyAndUncompressBlocksData(
+      filePath: Path,
+      out: HostMemoryOutputStream,
+      blocks: Seq[BlockMetaData],
+      realStartOffset: Long,
+      metrics: Map[String, GpuMetric]): Seq[BlockMetaData] = {
+    val startPos = out.getPos
+    val filePathString: String = filePath.toString
+    val remoteItems = new ArrayBuffer[CopyRange](blocks.length)
+    var outputOffset = startPos
+    blocks.foreach { block =>
+      block.getColumns.asScala.foreach { column =>
+        val columnInputSize = column.getTotalSize
+        val needsDecompress = column.getCodec == CompressionCodecName.SNAPPY
+        val columnOutputSize = if (needsDecompress) {
+          column.getTotalUncompressedSize
+        } else {
+          columnInputSize
+        }
+        val channel = FileCache.get.getDataRangeChannel(filePathString,
+          column.getStartingPos, columnInputSize, conf)
+        if (channel.isDefined) {
+          decompressColumn(channel.get, columnInputSize, out, outputOffset)
+        } else {
+          remoteItems += CopyRange(column.getStartingPos, columnSize, outputOffset)
+        }
+        outputOffset += columnOutputSize
+      }
+    }
+
+    copyRemoteBlocksData(remoteItems.toSeq, filePath,
+      filePathString, out, metrics)
+    // fixup output pos after blocks were copied possibly out of order
+    out.seek(startPos + totalBytesToCopy)
+    computeBlockMetaData(blocks, realStartOffset)
+  }
+
   private def copyRemoteBlocksData(
       remoteCopies: Seq[CopyRange],
       filePath: Path,
@@ -1667,7 +1725,11 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       closeOnExcept(HostMemoryBuffer.allocate(estTotalSize)) { hmb =>
         val out = new HostMemoryOutputStream(hmb)
         out.write(ParquetPartitionReader.PARQUET_MAGIC)
-        val outputBlocks = copyBlocksData(filePath, out, blocks, out.getPos, metrics)
+        val outputBlocks = if (decompressOnCpu) {
+          copyAndUncompressBlocksData(filePath, out, blocks, out.getPos, metrics)
+        } else {
+          copyBlocksData(filePath, out, blocks, out.getPos, metrics)
+        }
         val footerPos = out.getPos
         writeFooter(out, outputBlocks, clippedSchema)
         BytesUtils.writeIntLittleEndian(out, (out.getPos - footerPos).toInt)

@@ -1116,6 +1116,13 @@ val GPU_COREDUMP_PIPE_PATTERN = conf("spark.rapids.gpu.coreDump.pipePattern")
     .checkValues(RapidsReaderType.values.map(_.toString))
     .createWithDefault(RapidsReaderType.AUTO.toString)
 
+  val PARQUET_DECOMPRESS_SNAPPY_ON_CPU =
+    conf("spark.rapids.sql.format.parquet.decompressSnappyOnCpu")
+      .doc("If true then the CPU decompresses Parquet Snappy data rather than the GPU")
+      .internal()
+      .booleanConf
+      .createWithDefault(false)
+
   val READER_MULTITHREADED_COMBINE_THRESHOLD =
     conf("spark.rapids.sql.reader.multithreaded.combine.sizeBytes")
       .doc("The target size in bytes to combine multiple small files together when using the " +
@@ -2906,6 +2913,8 @@ class RapidsConf(conf: Map[String, String]) extends Logging {
 
   lazy val isParquetMultiThreadReadEnabled: Boolean = isParquetAutoReaderEnabled ||
     RapidsReaderType.withName(get(PARQUET_READER_TYPE)) == RapidsReaderType.MULTITHREADED
+
+  lazy val parquetDecompressSnappyOnCpu: Boolean = get(PARQUET_DECOMPRESS_SNAPPY_ON_CPU)
 
   lazy val maxNumParquetFilesParallel: Int = get(PARQUET_MULTITHREAD_READ_MAX_NUM_FILES_PARALLEL)
 
