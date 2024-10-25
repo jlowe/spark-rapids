@@ -43,6 +43,7 @@ import org.apache.commons.io.IOUtils
 import org.apache.commons.io.output.{CountingOutputStream, NullOutputStream}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FSDataInputStream, Path}
+import org.apache.parquet.{HadoopReadOptions, ParquetReadOptions}
 import org.apache.parquet.bytes.BytesUtils
 import org.apache.parquet.bytes.BytesUtils.readIntLittleEndian
 import org.apache.parquet.column.ColumnDescriptor
@@ -51,6 +52,7 @@ import org.apache.parquet.format.converter.ParquetMetadataConverter
 import org.apache.parquet.hadoop.{ParquetFileReader, ParquetInputFormat}
 import org.apache.parquet.hadoop.ParquetFileWriter.MAGIC
 import org.apache.parquet.hadoop.metadata._
+import org.apache.parquet.hadoop.util.HadoopCodecs
 import org.apache.parquet.io.{InputFile, SeekableInputStream}
 import org.apache.parquet.schema.{DecimalMetadata, GroupType, MessageType, OriginalType, PrimitiveType, Type}
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
@@ -1488,6 +1490,20 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
     range.length
   }
 
+  private def decompressDataRange(
+      range: CopyRange,
+      in: FSDataInputStream,
+      out: HostMemoryOutputStream,
+      copyBuffer: Array[Byte]): Long = {
+    // TODO: Consider using direct codec factory
+    // TODO: This doesn't perform CRC verification if requested (disabled by default in parquet)
+    val decompressor = HadoopCodecs.newDirectFactory(conf, 0).getDecompressor(range.codec)
+    // for all page headers:
+    //   use parquet Util.readPageHeader to read page header
+    //   emit new page header or just copy old one if we don't have to fixup compressed size
+    //   uncompress page data
+  }
+
   /**
    * Computes new block metadata to reflect where the blocks and columns will appear in the
    * computed Parquet file.
@@ -1677,7 +1693,14 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
         withResource(filePath.getFileSystem(conf).open(filePath)) { in =>
           val copyBuffer: Array[Byte] = new Array[Byte](copyBufferSize)
           coalescedRanges.foldLeft(0L) { (acc, blockCopy) =>
-            acc + copyDataRange(blockCopy, in, out, copyBuffer)
+            val bytesCopied = blockCopy.codec match {
+              case CompressionCodecName.UNCOMPRESSED =>
+                copyDataRange(blockCopy, in, out, copyBuffer)
+              case CompressionCodecName.SNAPPY =>
+                decompressDataRange(blockCopy, in, out, copyBuffer)
+              case c => throw new IllegalStateException(s"Unexpected codec $c")
+            }
+            acc + bytesCopied
           }
         }
       }
@@ -1685,6 +1708,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
     remoteCopies.foreach { range =>
       metrics.getOrElse(GpuMetric.FILECACHE_DATA_RANGE_MISSES, NoopMetric) += 1
       metrics.getOrElse(GpuMetric.FILECACHE_DATA_RANGE_MISSES_SIZE, NoopMetric) += range.length
+      // TODO: FIX FOR CODEC
       val cacheToken = FileCache.get.startDataRangeCache(
         filePathString, range.offset, range.length, conf)
       // If we get a filecache token then we can complete the caching by providing the data.
