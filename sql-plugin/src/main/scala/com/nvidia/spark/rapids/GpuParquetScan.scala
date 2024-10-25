@@ -33,7 +33,7 @@ import scala.language.implicitConversions
 import ai.rapids.cudf._
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.GpuMetric._
-import com.nvidia.spark.rapids.ParquetPartitionReader.{CopyRange, LocalCopy}
+import com.nvidia.spark.rapids.ParquetPartitionReader.{CopyDecompressRange, CopyRange, LocalCopy}
 import com.nvidia.spark.rapids.RapidsConf.ParquetFooterReaderType
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.filecache.FileCache
@@ -1606,6 +1606,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
     val startPos = out.getPos
     val filePathString: String = filePath.toString
     val remoteItems = new ArrayBuffer[CopyRange](blocks.length)
+    val newBlocks = new ArrayBuffer[BlockMetaData](blocks.length)
     var outputOffset = startPos
     blocks.foreach { block =>
       block.getColumns.asScala.foreach { column =>
@@ -1621,7 +1622,8 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
         if (channel.isDefined) {
           decompressColumn(channel.get, columnInputSize, out, outputOffset)
         } else {
-          remoteItems += CopyRange(column.getStartingPos, columnSize, outputOffset)
+          remoteItems += CopyDecompressRange(column.getStartingPos, columnInputSize,
+            columnOutputSize, outputOffset, column.getCodec)
         }
         outputOffset += columnOutputSize
       }
@@ -1630,8 +1632,16 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
     copyRemoteBlocksData(remoteItems.toSeq, filePath,
       filePathString, out, metrics)
     // fixup output pos after blocks were copied possibly out of order
-    out.seek(startPos + totalBytesToCopy)
-    computeBlockMetaData(blocks, realStartOffset)
+    out.seek(startPos + outputOffset)
+    newBlocks.toSeq
+  }
+
+  private def copyDecompressRemoteBlocksData(
+      remoteCopies: Seq[CopyDecompressRange],
+      filePath: Path,
+      filePathString: String,
+      out: HostMemoryOutputStream,
+      metrics: Map[String, GpuMetric]): Unit = {
   }
 
   private def copyRemoteBlocksData(
@@ -1720,6 +1730,8 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       blocks: Seq[BlockMetaData],
       clippedSchema: MessageType,
       filePath: Path): (HostMemoryBuffer, Long, Seq[BlockMetaData]) = {
+    // TODO: FIXME
+    val decompressOnCpu = true
     withResource(new NvtxRange("Parquet buffer file split", NvtxColor.YELLOW)) { _ =>
       val estTotalSize = calculateParquetOutputSize(blocks, clippedSchema, false)
       closeOnExcept(HostMemoryBuffer.allocate(estTotalSize)) { hmb =>
@@ -2935,6 +2947,13 @@ object ParquetPartitionReader {
       offset: Long,
       length: Long,
       outputOffset: Long) extends CopyItem
+
+  private[rapids] case class CopyDecompressRange(
+      offset: Long,
+      length: Long,
+      outputOffset: Long,
+      outputLength: Long,
+      codec: CompressionCodecName)
 
   /**
    * Build a new BlockMetaData
