@@ -33,7 +33,7 @@ import scala.language.implicitConversions
 import ai.rapids.cudf._
 import com.nvidia.spark.rapids.Arm.{closeOnExcept, withResource}
 import com.nvidia.spark.rapids.GpuMetric._
-import com.nvidia.spark.rapids.ParquetPartitionReader.{CopyDecompressRange, CopyRange, LocalCopy}
+import com.nvidia.spark.rapids.ParquetPartitionReader.{CopyRange, LocalCopy}
 import com.nvidia.spark.rapids.RapidsConf.ParquetFooterReaderType
 import com.nvidia.spark.rapids.RapidsPluginImplicits._
 import com.nvidia.spark.rapids.filecache.FileCache
@@ -1418,7 +1418,8 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       currentChunkedBlocks: Seq[BlockMetaData],
       schema: MessageType,
       handleCoalesceFiles: Boolean,
-      isSnappyOnCpu: Boolean): Long = {
+      // TODO: FIXME
+      isSnappyOnCpu: Boolean = true): Long = {
     // start with the size of Parquet magic (at start+end) and footer length values
     var size: Long = PARQUET_META_SIZE
 
@@ -1606,13 +1607,14 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
     val startPos = out.getPos
     val filePathString: String = filePath.toString
     val remoteItems = new ArrayBuffer[CopyRange](blocks.length)
-    val newBlocks = new ArrayBuffer[BlockMetaData](blocks.length)
     var outputOffset = startPos
-    blocks.foreach { block =>
-      block.getColumns.asScala.foreach { column =>
+    val newBlocks = blocks.map { block =>
+      val newColumns = block.getColumns.asScala.map { column =>
         val columnInputSize = column.getTotalSize
-        val needsDecompress = column.getCodec == CompressionCodecName.SNAPPY
+        var newBlockCodec = column.getCodec
+        val needsDecompress = newBlockCodec == CompressionCodecName.SNAPPY
         val columnOutputSize = if (needsDecompress) {
+          newBlockCodec = CompressionCodecName.UNCOMPRESSED
           column.getTotalUncompressedSize
         } else {
           columnInputSize
@@ -1620,28 +1622,40 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
         val channel = FileCache.get.getDataRangeChannel(filePathString,
           column.getStartingPos, columnInputSize, conf)
         if (channel.isDefined) {
-          decompressColumn(channel.get, columnInputSize, out, outputOffset)
+          throw new UnsupportedOperationException()
+          //decompressColumn(channel.get, columnInputSize, out, outputOffset)
         } else {
-          remoteItems += CopyDecompressRange(column.getStartingPos, columnInputSize,
+          remoteItems += CopyRange(column.getStartingPos, columnInputSize,
             columnOutputSize, outputOffset, column.getCodec)
         }
+        val newDictOffset = if (column.getDictionaryPageOffset > 0) {
+          column.getDictionaryPageOffset + outputOffset - column.getStartingPos
+        } else {
+          0
+        }
+        val newColumn = ColumnChunkMetaData.get(
+          column.getPath,
+          column.getPrimitiveType,
+          newBlockCodec,
+          column.getEncodingStats,
+          column.getEncodings,
+          column.getStatistics,
+          outputOffset,
+          newDictOffset,
+          column.getValueCount,
+          columnOutputSize,
+          column.getTotalUncompressedSize)
         outputOffset += columnOutputSize
+        newColumn
       }
+      GpuParquetUtils.newBlockMeta(block.getRowCount, newColumns)
     }
 
     copyRemoteBlocksData(remoteItems.toSeq, filePath,
       filePathString, out, metrics)
     // fixup output pos after blocks were copied possibly out of order
     out.seek(startPos + outputOffset)
-    newBlocks.toSeq
-  }
-
-  private def copyDecompressRemoteBlocksData(
-      remoteCopies: Seq[CopyDecompressRange],
-      filePath: Path,
-      filePathString: String,
-      out: HostMemoryOutputStream,
-      metrics: Map[String, GpuMetric]): Unit = {
+    newBlocks
   }
 
   private def copyRemoteBlocksData(
@@ -1686,6 +1700,8 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
     val coalesced = new ArrayBuffer[CopyRange](ranges.length)
     var currentRange: CopyRange = null
     var currentRangeEnd = 0L
+    var currentOutputLength = 0L
+    var currentCodec = CompressionCodecName.UNCOMPRESSED
 
     def addCurrentRange(): Unit = {
       if (currentRange != null) {
@@ -1693,20 +1709,25 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
         if (rangeLength == currentRange.length) {
           coalesced += currentRange
         } else {
-          coalesced += currentRange.copy(length = rangeLength)
+          coalesced += currentRange.copy(length = rangeLength, outputLength = currentOutputLength)
         }
         currentRange = null
         currentRangeEnd = 0L
+        currentOutputLength = 0L
+        currentCodec = CompressionCodecName.UNCOMPRESSED
       }
     }
 
     ranges.foreach { c =>
-      if (c.offset == currentRangeEnd) {
+      if (c.offset == currentRangeEnd && c.codec == currentCodec) {
         currentRangeEnd += c.length
+        currentOutputLength += c.outputLength
       } else {
         addCurrentRange()
         currentRange = c
         currentRangeEnd = c.offset + c.length
+        currentOutputLength = c.outputLength
+        currentCodec = c.codec
       }
     }
     addCurrentRange()
@@ -2946,14 +2967,14 @@ object ParquetPartitionReader {
   private[rapids] case class CopyRange(
       offset: Long,
       length: Long,
-      outputOffset: Long) extends CopyItem
-
-  private[rapids] case class CopyDecompressRange(
-      offset: Long,
-      length: Long,
       outputOffset: Long,
       outputLength: Long,
-      codec: CompressionCodecName)
+      codec: CompressionCodecName) extends CopyItem
+
+  private[rapids] object CopyRange {
+    def apply(offset: Long, length: Long, outputOffset: Long): CopyRange =
+      CopyRange(offset, length, outputOffset, length, CompressionCodecName.UNCOMPRESSED)
+  }
 
   /**
    * Build a new BlockMetaData
