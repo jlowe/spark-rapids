@@ -27,6 +27,7 @@ import java.util.concurrent._
 
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
+import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.language.implicitConversions
 
@@ -1431,7 +1432,11 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
     size += currentChunkedBlocks.flatMap { block =>
       block.getColumns.asScala.map { c =>
         if (isSnappyOnCpu && c.getCodec == CompressionCodecName.SNAPPY) {
-          c.getTotalUncompressedSize
+          // Page headers need to be rewritten when CPU decompresses, and that may
+          // increase the size of the page header. Guess how many pages there may be
+          // and add a fudge factor per page to try to avoid a late realloc+copy.
+          val estimatedPageCount = (c.getTotalUncompressedSize / (1024 * 1024)) + 1
+          c.getTotalUncompressedSize + estimatedPageCount * 8
         } else {
           c.getTotalSize
         }
@@ -1494,7 +1499,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       range: CopyRange,
       in: FSDataInputStream,
       out: HostMemoryOutputStream,
-      copyBuffer: Array[Byte]): Long = {
+      copyBuffer: Array[Byte]): Map[Long, Long] = {
     // TODO: Consider using direct codec factory
     // TODO: This doesn't perform CRC verification if requested (disabled by default in parquet)
     var readTime = 0L
@@ -1518,8 +1523,10 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
         bytesLeft -= readLength
       }
       val start = System.nanoTime()
+      val pageOffsetRemap: mutable.Map[Long, Long] = mutable.Map.empty
       val srcIn = new HostMemoryInputStream(srcData, srcData.getLength)
       while (srcIn.available() > 0) {
+        pageOffsetRemap(range.offset + srcIn.getPos) = out.getPos
         val pageHeader = Util.readPageHeader(srcIn)
         val uncompressedSize = pageHeader.getUncompressed_page_size
         val bbIn = srcIn.readByteBuffer(pageHeader.getCompressed_page_size)
@@ -1533,7 +1540,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       writeTime += System.nanoTime - start
       execMetrics.get(READ_FS_TIME).foreach(_.add(readTime))
       execMetrics.get(WRITE_BUFFER_TIME).foreach(_.add(writeTime))
-      range.length
+      pageOffsetRemap.toMap
     }
   }
 
@@ -1550,7 +1557,8 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
   )
   protected def computeBlockMetaData(
       blocks: Seq[BlockMetaData],
-      realStartOffset: Long): Seq[BlockMetaData] = {
+      realStartOffset: Long,
+      pageOffsetRemap: Map[Long, Long]): Seq[BlockMetaData] = {
     val outputBlocks = new ArrayBuffer[BlockMetaData](blocks.length)
     var totalBytesToCopy = 0L
     blocks.foreach { block =>
@@ -1559,8 +1567,10 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       columns.foreach { column =>
         // update column metadata to reflect new position in the output file
         val startPosCol = column.getStartingPos
-        val offsetAdjustment = realStartOffset + totalBytesToCopy - startPosCol
+        val columnStartOffset = pageOffsetRemap.getOrElse(
+          column.getStartingPos, realStartOffset + totalBytesToCopy)
         val newDictOffset = if (column.getDictionaryPageOffset > 0) {
+          val offsetAdjustment = realStartOffset + totalBytesToCopy - startPosCol
           column.getDictionaryPageOffset + offsetAdjustment
         } else {
           0
@@ -1574,7 +1584,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
           column.getEncodingStats,
           column.getEncodings,
           column.getStatistics,
-          column.getStartingPos + offsetAdjustment,
+          columnStartOffset,
           newDictOffset,
           column.getValueCount,
           columnSize,
@@ -1628,11 +1638,11 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
         localItem.close()
       }
     }
-    copyRemoteBlocksData(remoteItems.toSeq, filePath,
+    val pageOffsetRemap = copyRemoteBlocksData(remoteItems.toSeq, filePath,
       filePathString, out, metrics)
     // fixup output pos after blocks were copied possibly out of order
     out.seek(startPos + totalBytesToCopy)
-    computeBlockMetaData(blocks, realStartOffset)
+    computeBlockMetaData(blocks, realStartOffset, pageOffsetRemap)
   }
 
   /**
@@ -1712,28 +1722,28 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       filePath: Path,
       filePathString: String,
       out: HostMemoryOutputStream,
-      metrics: Map[String, GpuMetric]): Long = {
+      metrics: Map[String, GpuMetric]): Map[Long, Long] = {
     if (remoteCopies.isEmpty) {
-      return 0L
+      return Map.empty
     }
 
     val coalescedRanges = coalesceReads(remoteCopies)
 
-    val totalBytesCopied = PerfIO.readToHostMemory(
+    val pageOffsetRemap: mutable.Map[Long, Long] = mutable.Map.empty
+    PerfIO.readToHostMemory(
         conf, out.buffer, filePath.toUri,
         coalescedRanges.map(r => IntRangeWithOffset(r.offset, r.length, r.outputOffset))
       ).getOrElse {
         withResource(filePath.getFileSystem(conf).open(filePath)) { in =>
           val copyBuffer: Array[Byte] = new Array[Byte](copyBufferSize)
-          coalescedRanges.foldLeft(0L) { (acc, blockCopy) =>
-            val bytesCopied = blockCopy.codec match {
+          coalescedRanges.foreach { blockCopy =>
+            blockCopy.codec match {
               case CompressionCodecName.UNCOMPRESSED =>
                 copyDataRange(blockCopy, in, out, copyBuffer)
               case CompressionCodecName.SNAPPY =>
-                decompressDataRange(blockCopy, in, out, copyBuffer)
+                pageOffsetRemap ++= decompressDataRange(blockCopy, in, out, copyBuffer)
               case c => throw new IllegalStateException(s"Unexpected codec $c")
             }
-            acc + bytesCopied
           }
         }
       }
@@ -1750,7 +1760,7 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
         token.complete(out.buffer.slice(range.outputOffset, range.length))
       }
     }
-    totalBytesCopied
+    pageOffsetRemap.toMap
   }
 
   private def coalesceReads(ranges: Seq[CopyRange]): Seq[CopyRange] = {
@@ -2103,7 +2113,7 @@ class MultiFileParquetPartitionReader(
     // Some Parquet versions sanity check the block metadata, and since the blocks could be from
     // multiple files they will not pass the checks as they are.
     val blockStartOffset = ParquetPartitionReader.PARQUET_MAGIC.length
-    val updatedBlocks = computeBlockMetaData(allBlocks, blockStartOffset)
+    val updatedBlocks = computeBlockMetaData(allBlocks, blockStartOffset, Map.empty)
     calculateParquetOutputSize(updatedBlocks, batchContext.schema, true)
   }
 
@@ -2312,7 +2322,8 @@ class MultiFileCloudParquetPartitionReader(
             combinedHmb.copyFromHostBuffer(offset, hmbInfo.hmb,
               ParquetPartitionReader.PARQUET_MAGIC.size, copyAmount)
           }
-          val outputBlocks = computeBlockMetaData(hmbInfo.blockMeta, offset)
+          // TODO: FIXME
+          val outputBlocks = computeBlockMetaData(hmbInfo.blockMeta, offset, Map.empty)
           allOutputBlocks ++= outputBlocks
           offset += copyAmount
           if (hmbInfo.hmb != null) {
