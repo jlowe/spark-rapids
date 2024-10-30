@@ -43,19 +43,19 @@ import org.apache.commons.io.IOUtils
 import org.apache.commons.io.output.{CountingOutputStream, NullOutputStream}
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FSDataInputStream, Path}
-import org.apache.parquet.{HadoopReadOptions, ParquetReadOptions}
 import org.apache.parquet.bytes.BytesUtils
 import org.apache.parquet.bytes.BytesUtils.readIntLittleEndian
 import org.apache.parquet.column.ColumnDescriptor
 import org.apache.parquet.filter2.predicate.FilterApi
+import org.apache.parquet.format.Util
 import org.apache.parquet.format.converter.ParquetMetadataConverter
 import org.apache.parquet.hadoop.{ParquetFileReader, ParquetInputFormat}
 import org.apache.parquet.hadoop.ParquetFileWriter.MAGIC
 import org.apache.parquet.hadoop.metadata._
-import org.apache.parquet.hadoop.util.HadoopCodecs
 import org.apache.parquet.io.{InputFile, SeekableInputStream}
 import org.apache.parquet.schema.{DecimalMetadata, GroupType, MessageType, OriginalType, PrimitiveType, Type}
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
+import org.xerial.snappy.Snappy
 
 import org.apache.spark.TaskContext
 import org.apache.spark.broadcast.Broadcast
@@ -1497,11 +1497,44 @@ trait ParquetPartitionReaderBase extends Logging with ScanWithMetrics
       copyBuffer: Array[Byte]): Long = {
     // TODO: Consider using direct codec factory
     // TODO: This doesn't perform CRC verification if requested (disabled by default in parquet)
-    val decompressor = HadoopCodecs.newDirectFactory(conf, 0).getDecompressor(range.codec)
-    // for all page headers:
-    //   use parquet Util.readPageHeader to read page header
-    //   emit new page header or just copy old one if we don't have to fixup compressed size
-    //   uncompress page data
+    var readTime = 0L
+    var writeTime = 0L
+    if (in.getPos != range.offset) {
+      in.seek(range.offset)
+    }
+    withResource(HostMemoryBuffer.allocate(range.length, false)) { srcData =>
+      // copy bytes from filesystem
+      var bytesLeft = range.length
+      while (bytesLeft > 0) {
+        // downcast is safe because copyBuffer.length is an int
+        val readLength = Math.min(bytesLeft, copyBuffer.length).toInt
+        val start = System.nanoTime()
+        in.readFully(copyBuffer, 0, readLength)
+        val mid = System.nanoTime()
+        out.write(copyBuffer, 0, readLength)
+        val end = System.nanoTime()
+        readTime += (mid - start)
+        writeTime += (end - mid)
+        bytesLeft -= readLength
+      }
+      val start = System.nanoTime()
+      val srcIn = new HostMemoryInputStream(srcData, srcData.getLength)
+      while (srcIn.available() > 0) {
+        val pageHeader = Util.readPageHeader(srcIn)
+        val uncompressedSize = pageHeader.getUncompressed_page_size
+        val bbIn = srcIn.readByteBuffer(pageHeader.getCompressed_page_size)
+        // TODO: This could change the size of the page header, need to account for this
+        // in block metadata
+        pageHeader.setCompressed_page_size(uncompressedSize)
+        Util.writePageHeader(pageHeader, out)
+        val bbOut = out.writeAsByteBuffer(uncompressedSize)
+        Snappy.uncompress(bbIn, bbOut)
+      }
+      writeTime += System.nanoTime - start
+      execMetrics.get(READ_FS_TIME).foreach(_.add(readTime))
+      execMetrics.get(WRITE_BUFFER_TIME).foreach(_.add(writeTime))
+      range.length
+    }
   }
 
   /**
